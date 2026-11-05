@@ -3624,14 +3624,18 @@ its agent status" under Hosted team relay.
   the 1.x wire names (`session.execution.started` → user `message.updated`, `…succeeded|interrupted`
   → `session.idle`, `…failed` → `session.error`, `form.*` → `question.*`), so `normalizeOpencode` has
   one dialect, and it drops a subagent child session's turn events (forwarding its permission/form
-  under the root session). **It refuses to run inside 2.x's shared background server**
-  (`serve --service`, argv): by default every 2.x CLI talks to ONE server that keeps the env of
-  whichever pane started it and outlives it — measured, a second pane's events carried the first
-  pane's `NODETERM_NODE_ID` — so posting from it would paint one node's status on another (the
-  codex `--no-daemon` problem). Only a `--standalone` server (the pane's own `serve --stdio` child)
-  reports, so **2.x status needs `opencode --standalone`**; nodeterm does not pass it yet (1.x exits
-  on the unknown flag, so it needs a codex-style `--help` probe — follow-up), and until then the
-  Launch commands override (`opencode --standalone`) is the user's switch.
+  under the root session). **It arms in 2.x's shared background server (`serve --service`) too**:
+  by default every 2.x CLI talks to ONE server that keeps the env of whichever pane started it and
+  outlives it — measured, a second pane's events carried the first pane's `NODETERM_NODE_ID` — so
+  posting from it paints one node's status on another (the codex `--no-daemon` problem). It used
+  to refuse to run there so the 1.x file beside it could report instead, but that yield was
+  sound only while both generations could load: 2.x rejects the 1.x file at load and loads
+  plugins ONLY in serve processes (measured in the field across 2.1.3–2.2.5, Nov 2026), so every
+  long-lived server on a nodeterm machine is the managed `serve --service` — the refusal left no
+  subscriber anywhere and the badge froze. The accepted trade: posts carry the server's own
+  `NODETERM_NODE_ID`, so multi-pane attribution is imprecise while a single active pane is exact;
+  an `opencode --standalone` launch override still pins a pane's own env when a user wants that
+  precision, but it is a switch, not a requirement.
   **Codex is the one agent whose hook command is NOT a POSIX one-liner on Windows** (issue #567):
   it builds the command as `cmd.exe /C <string>` (`codex-rs/hooks/src/engine/command_runner.rs`,
   rust-v0.151.0) unless the session has a shell configured, which a default Windows install has

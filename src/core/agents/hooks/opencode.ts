@@ -232,9 +232,15 @@ export const NodetermStatus = async () => {
  *  session.error, form.* → question.*.
  *  THE SHARED SERVER: by default every 2.x CLI talks to ONE background server (`serve --service`)
  *  that keeps the environment of whichever pane started it and outlives it (MEASURED: a second
- *  pane's events ran under the first pane's NODETERM_NODE_ID). Posting from there would paint one
- *  node's status on another, so the plugin refuses to run in it. Only a `--standalone` server (the
- *  pane's own child, `serve --stdio`, which inherits the pane's env) reports. */
+ *  pane's events ran under the first pane's NODETERM_NODE_ID). This template once refused to arm
+ *  there so the 1.x file beside it could report instead — sound only while both generations could
+ *  load: 2.x rejects that file at load (no default export) and loads plugins ONLY in serve
+ *  processes (measured in the field across 2.1.3–2.2.5, Nov 2026), so every long-lived server on
+ *  a nodeterm machine is the managed `serve --service` and the yield left no subscriber anywhere
+ *  — the badge froze. setup() now arms wherever it is loaded; posts carry the server's own
+ *  NODETERM_NODE_ID (the pane that started it), so multi-pane attribution is imprecise while a
+ *  single active pane is exact — the trade the 1.x plugin made before 2.x, accepted here over a
+ *  dead badge. */
 export function buildOpencodeV2Plugin(): string {
   return `${PLUGIN_MARKER}
 // OpenCode 2.x plugin (a directory, so that no OpenCode 1.x ever loads it).
@@ -292,9 +298,6 @@ export default {
   id: 'nodeterm-status',
   async setup(ctx) {
     if (!ctx || !ctx.event || typeof ctx.event.subscribe !== 'function') return
-    // The shared background server's env belongs to whichever pane started it (see above).
-    const argv = (typeof process !== 'undefined' && process.argv) || []
-    if (argv.includes('--service')) return
     const post = makePoster()
     if (!post) return
     if (!claim('v2')) return

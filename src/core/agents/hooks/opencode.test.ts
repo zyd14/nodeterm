@@ -524,6 +524,13 @@ describe('generated plugins, module shapes (executed)', () => {
 
   beforeEach(() => {
     posts = []
+    // Env-stripping, ported from the upstream regression suite: this file may run inside a
+    // nodeterm-managed pane whose env carries the REAL hook endpoint/socket/token dir. Stub away
+    // EVERY inherited NODETERM_* var first — empty string is falsy everywhere the generated
+    // plugin looks — then set only the dummies below, so no case can reach a real endpoint.
+    for (const key of Object.keys(process.env)) {
+      if (key.startsWith('NODETERM_')) vi.stubEnv(key, '')
+    }
     vi.stubGlobal('fetch', (_url: string, init: { body: string }) => {
       posts.push(JSON.parse(new URLSearchParams(init.body).get('payload') ?? '{}'))
       return Promise.resolve(new Response())
@@ -733,7 +740,36 @@ describe('generated plugins, module shapes (executed)', () => {
     v2.end()
   })
 
-  it('2.x: stays inert inside the shared background server (`serve --service`) — its env names another pane', async () => {
+  it('2.x: arms inside the shared background server (`serve --service`) — on 2.x that is the only process that loads plugins', async () => {
+    // The regression (measured in the field across OpenCode 2.1.3–2.2.5, Nov 2026): 2.x loads
+    // plugins ONLY in serve processes, and the long-lived server a nodeterm machine keeps is the
+    // managed `opencode serve --service`. The 1.x file beside this plugin cannot arm there (2.x
+    // rejects it at load — no default export), so a v2 that steps aside in `--service` processes
+    // leaves no subscriber anywhere and the badge froze. Yielding was a 1.x-era rule (there the
+    // v1 file COULD load in the same process); on 2.x setup() must arm and stay armed.
+    const def = await loadV2()
+    const v2 = v2Context()
+    const argv = process.argv
+    process.argv = ['bun', '/$bunfs/root/opencode', 'serve', '--service']
+    try {
+      const cleanup = await def.setup(v2.ctx)
+      expect(v2.subscribed()).toBe(1)
+      expect(v2.toolHooks.map((h) => h.name)).toEqual(['execute.before'])
+      expect(g[LATCH]).toBe('v2') // armed as v2 — the latch still arbitrates v1 vs v2 per process
+      expect(typeof cleanup).toBe('function')
+      expect(v2.signal()?.aborted).toBe(false)
+      ;(cleanup as () => void)()
+      expect(v2.signal()?.aborted).toBe(true) // the returned cleanup aborts the subscription
+    } finally {
+      process.argv = argv
+    }
+    v2.end()
+  })
+
+  it('2.x: no NODETERM_NODE_ID (outside nodeterm) → no subscription, no hook — even in a `--service` server', async () => {
+    // Removing the --service yield must not overcorrect: the node-id gate (makePoster() → null)
+    // keeps the plugin inert outside nodeterm-spawned envs, whatever the process shape is.
+    vi.stubEnv('NODETERM_NODE_ID', '')
     const def = await loadV2()
     const v2 = v2Context()
     const argv = process.argv
@@ -748,13 +784,89 @@ describe('generated plugins, module shapes (executed)', () => {
     expect(g[LATCH]).toBeUndefined()
   })
 
-  it('2.x: no NODETERM_NODE_ID (outside nodeterm) → no subscription, no hook', async () => {
-    vi.stubEnv('NODETERM_NODE_ID', '')
-    const def = await loadV2()
-    const v2 = v2Context()
-    await def.setup(v2.ctx)
-    expect(v2.subscribed()).toBe(0)
-    expect(v2.toolHooks).toEqual([])
+  it('2.x: the generated template carries no `--service` early return', () => {
+    // Durable source guard, ported from the local regression suite's `service_early_return_absent`:
+    // if the early return ever comes back, every 2.x machine's badge dies silently again (see the
+    // service-server test above for why). Asserted on the exact expression so that comments ABOUT
+    // `serve --service` may still live in the template.
+    expect(buildOpencodeV2Plugin()).not.toContain("argv.includes('--service')")
+  })
+
+  it('2.x: posts the full wire format from a `--service` server to a local unix-socket collector', async () => {
+    // Ported from the upstream suite's `posts_to_local_collector`. The ONLY endpoint configured is
+    // a throwaway unix socket this test creates in its own temp dir (never a real nodeterm one),
+    // and the per-node token comes from a token dir this test writes — so the full POST contract
+    // (both bearer headers, form encoding, the three body fields) is checked against the real
+    // node:http socketPath transport, from inside a `serve --service` process: on 2.x that is the
+    // process the plugin runs in.
+    const { createServer } = await import('node:http')
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nt-oc-v2-'))
+    const tokenDir = path.join(dir, 'tokens')
+    fs.mkdirSync(tokenDir)
+    const nodeId = 'node-v2-wire'
+    // The per-node token file (<dir>/<nodeId>, first line is the bearer) — the same file shape
+    // hook-server.ts reads (a lookup by name, never a scan).
+    fs.writeFileSync(path.join(tokenDir, nodeId), 'node-token\nignored-second-line\n')
+    const hits: Array<{ method: string; url: string; headers: Record<string, string>; body: string }> = []
+    const server = createServer((req, res) => {
+      const chunks: Buffer[] = []
+      req.on('data', (c: Buffer) => chunks.push(c))
+      req.on('end', () => {
+        hits.push({
+          method: req.method ?? '',
+          url: req.url ?? '',
+          headers: {
+            'x-nodeterm-hook-token': String(req.headers['x-nodeterm-hook-token'] ?? ''),
+            'x-nodeterm-node-token': String(req.headers['x-nodeterm-node-token'] ?? ''),
+            'content-type': String(req.headers['content-type'] ?? '')
+          },
+          body: Buffer.concat(chunks).toString('utf8')
+        })
+        res.writeHead(204)
+        res.end()
+      })
+    })
+    const sock = path.join(dir, 'hook.sock')
+    await new Promise<void>((r) => server.listen(sock, r))
+    try {
+      vi.stubEnv('NODETERM_NODE_ID', nodeId)
+      vi.stubEnv('NODETERM_HOOK_SOCK', sock)
+      vi.stubEnv('NODETERM_HOOK_TOKEN', 'hook-token')
+      vi.stubEnv('NODETERM_HOOK_VERSION', '2')
+      vi.stubEnv('NODETERM_NODE_TOKEN_DIR', tokenDir)
+      const def = await loadV2()
+      const v2 = v2Context()
+      const argv = process.argv
+      process.argv = ['bun', '/$bunfs/root/opencode', 'serve', '--service']
+      try {
+        const cleanup = await def.setup(v2.ctx)
+        expect(v2.subscribed()).toBe(1) // armed at all (the regression) before anything else
+        v2.push('session.created', { sessionID: 'sess-post-1' })
+        // The plugin posts from a detached async loop; poll the local collector briefly.
+        await vi.waitFor(() => expect(hits.length).toBe(1))
+        const hit = hits[0]
+        expect(hit.method).toBe('POST')
+        expect(hit.url).toBe('/hook/opencode')
+        expect(hit.headers['x-nodeterm-hook-token']).toBe('hook-token')
+        expect(hit.headers['x-nodeterm-node-token']).toBe('node-token')
+        expect(hit.headers['content-type']).toBe('application/x-www-form-urlencoded')
+        const params = new URLSearchParams(hit.body)
+        expect(params.get('nodeId')).toBe(nodeId)
+        expect(params.get('version')).toBe('2')
+        expect(JSON.parse(params.get('payload') ?? '{}')).toEqual({
+          event: 'session.created',
+          sessionID: 'sess-post-1'
+        })
+        ;(cleanup as () => void)()
+      } finally {
+        process.argv = argv
+        v2.end()
+      }
+    } finally {
+      server.close()
+      server.closeAllConnections?.()
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
   })
 
   it('2.x: a context without an event stream (a 1.x compatibility pass) is a no-op', async () => {
