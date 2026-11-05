@@ -14,11 +14,19 @@
 //    export as a function: an object default throws `fn is not a function` and kills every opencode
 //    command on the machine, inside nodeterm or not (bisected: 1.2.10 crashes, 1.2.11 does not).
 // So the V1 plugin stays a file with only the named export (V2 merely WARNs about it), and the V2
-// plugin is a DIRECTORY, which no 1.x glob matches.
+// plugin is a DIRECTORY, which no 1.x glob matches. Which of them is PLANTED is gated on the
+// installed CLI's major version — see the version probe above installOpencodeHooks(): on a
+// known 2.x the 1.x file is not planted at all (and a managed copy from an older nodeterm is
+// removed), because 2.x WARNs on it at every load and reloads plugin files on change.
 import fs from 'fs'
 import os from 'os'
 import path from 'path'
+import { execFile } from 'child_process'
+import { promisify } from 'util'
 import { parseEndpointEnv } from '../hook-endpoint-parse'
+import { directExecutableInvocation, findInLoginPath } from '../../exec-path'
+
+const execFileP = promisify(execFile)
 
 export const PLUGIN_MARKER = '// nodeterm managed plugin — do not edit (reinstalled at app launch)'
 
@@ -168,8 +176,10 @@ const makePoster = () => {
 export function buildOpencodePlugin(): string {
   return `${PLUGIN_MARKER}
 // OpenCode 1.x plugin. OpenCode 2.x logs "failed to load plugin … must export a default
-// definition" for this file at every start: expected and harmless — 2.x is served by the
-// nodeterm-status-v2/ directory beside it. A default export here would crash opencode <= 1.2.10.
+// definition" for this file at every start — harmless, and on a KNOWN 2.x nodeterm does not
+// plant it at all (installOpencodeHooks removes a managed copy there); this file exists only
+// where the installed opencode is 1.x or its version could not be determined. A default
+// export here would crash opencode <= 1.2.10.
 ${sharedPrelude()}
 export const NodetermStatus = async () => {
   const post = makePoster()
@@ -340,9 +350,130 @@ function plantManaged(file: string, body: string): void {
   fs.writeFileSync(file, body, 'utf8')
 }
 
-export function installOpencodeHooks(): void {
-  plantManaged(pluginPath(), buildOpencodePlugin())
+// ── The version probe ─────────────────────────────────────────────────────────────────────
+// WHICH of the two plugins gets planted is decided by the installed CLI's major version: the
+// 1.x file is the only thing 1.x can load, but 2.x rejects it at every load (the WARN in the
+// header) AND watches plugin files for reloads — so a 2.x machine must not carry it at all,
+// not even between an install and a removal one launch later. The probe is modeled on
+// claude-cli.ts (memoized for the process, bounded, never rejects, UNKNOWN on any failure) so
+// the same conventions hold across CLIs.
+
+const OPENCODE_PROBE_TIMEOUT_MS = 5000
+
+/**
+ * Pure: an `opencode --version` output line → its MAJOR version, or null when no
+ * `major.minor.patch` is readable. Null must be read as "unknown", never as 2 — the caller's
+ * unknown branch is the conservative one that keeps planting the 1.x file.
+ *
+ * Mirrors the repo's version-floor convention (`versionAtLeast`, shared/agents/config.ts): the
+ * FIRST `major.minor.patch` on the line is the answer. MEASURED, 2026-11-05: the 2.x CLI
+ * prints `opencode v2.2.5` (exit 0).
+ *
+ * @param versionOutput stdout of `opencode --version` (null/undefined when there was none)
+ * @returns the major version (e.g. 2), or null when the line carries no readable version
+ */
+export function opencodeMajorFrom(versionOutput: string | null | undefined): number | null {
+  const m = (versionOutput ?? '').match(/(\d+)\.(\d+)\.(\d+)/)
+  return m ? Number(m[1]) : null
+}
+
+/**
+ * Probe the binary at `bin` for its major version: run `<bin> --version` bounded by a 5s
+ * timeout and parse the output. Missing binary, timeout and non-zero exit all resolve to null
+ * (unknown) — this never rejects, exactly like the claude probe it is modeled on.
+ *
+ * @param bin an already-resolved executable path (the login-shell PATH walk happens in
+ *   `opencodeMajor` below — a GUI app does not inherit the user's shell PATH)
+ * @returns the CLI's major version, or null when unknown
+ */
+export async function probeOpencodeMajorAt(bin: string): Promise<number | null> {
+  try {
+    const invocation = directExecutableInvocation(bin, ['--version'])
+    if (!invocation) return null
+    const { stdout } = await execFileP(invocation.executable, invocation.args, {
+      ...invocation.options,
+      timeout: OPENCODE_PROBE_TIMEOUT_MS
+    })
+    return opencodeMajorFrom(stdout)
+  } catch {
+    // Missing CLI, timeout, non-zero exit — all mean "unknown", which means "plant the 1.x
+    // file conservatively", never "guess 2.x and delete it".
+    return null
+  }
+}
+
+let cachedMajor: Promise<number | null> | null = null
+
+/**
+ * The installed OpenCode's major version, or null when unknown (no CLI found, timeout,
+ * unreadable output). Memoized for the process lifetime — the answer resolves the login shell
+ * and spawns the CLI, and it only changes when the user upgrades (which a relaunch picks up).
+ * Never rejects.
+ */
+export function opencodeMajor(): Promise<number | null> {
+  if (!cachedMajor) {
+    cachedMajor = findInLoginPath('opencode')
+      .then((bin) => (bin ? probeOpencodeMajorAt(bin) : null))
+      .catch(() => null)
+  }
+  return cachedMajor
+}
+
+/** The version probe as an injectable seam (the default is the memoized real probe above).
+ *  Resolves the installed CLI's major version, or null when unknown; never rejects. */
+export type OpencodeVersionProbe = () => Promise<number | null>
+
+// Installations are generational: removeOpencodeHooks() (the opt-out/uninstall path) bumps the
+// generation, so a decision that was still waiting on the version probe when the user declined
+// opencode — or uninstalled the app — can no longer write anything. Without this, a late
+// "1.x" answer would re-plant exactly the files the opt-out deleted, minutes after the user
+// asked for them gone.
+let installGeneration = 0
+
+/**
+ * Plant the managed plugins for the OpenCode generation(s) the machine can run.
+ *
+ * The 2.x DIRECTORY plants synchronously — it is invisible to every 1.x glob (see the header)
+ * and it is the only plugin a 2.x machine can load. The 1.x FILE is decided by `probe` once it
+ * answers:
+ *  - major >= 2: never planted, and a marker-managed copy an older nodeterm planted is REMOVED
+ *    (the upgrade migration; a user's own file without the marker is never touched either way);
+ *  - major <= 1, or UNKNOWN (no CLI found, probe failed, unreadable output): planted
+ *    conservatively — a <=1.x machine's badge must not depend on the probe succeeding, at the
+ *    cost of the harmless load WARN on a 2.x machine, which is the status quo this replaces.
+ * The 1.x file is NOT planted before the probe answers: 2.x watches plugin files and reloads on
+ * change, so planting it "for a moment" would WARN on every launch of a 2.x machine — the very
+ * noise this gate exists to stop.
+ *
+ * Returns a promise that settles once the version decision has been applied. It never
+ * rejects: a failed decision is contained with a console.warn, so the fire-and-forget registry
+ * entry (`hooks/index.ts`) stays quiet. The synchronous part may still throw on a filesystem
+ * error, exactly as before this became async — the registry's per-agent catch handles that.
+ *
+ * @param probe the version probe to consult (tests inject a controlled answer; production
+ *   uses the default memoized `opencodeMajor`)
+ */
+export function installOpencodeHooks(probe: OpencodeVersionProbe = opencodeMajor): Promise<void> {
+  const generation = installGeneration
+  // Resolved once, NOW: the decision runs after the probe, possibly after a spied/moved home —
+  // re-resolving there would send the late decision into the wrong home (antigravity's lesson,
+  // hooks/antigravity.ts installAntigravityHooksWithProbe).
+  const v1Path = pluginPath()
   plantManaged(v2PluginPath(), buildOpencodeV2Plugin())
+  return (
+    Promise.resolve()
+      .then(probe)
+      // A probe that fails is an unknown version — the conservative branch plants.
+      .catch(() => null)
+      .then((major) => {
+        if (generation !== installGeneration) return // a remove/opt-out superseded this pass
+        if (major !== null && major >= 2) removeManaged(v1Path)
+        else plantManaged(v1Path, buildOpencodePlugin())
+      })
+      .catch((e) => {
+        console.warn('[agent-hooks] opencode install failed', e)
+      })
+  )
 }
 
 function removeManaged(file: string): void {
@@ -354,6 +485,9 @@ function removeManaged(file: string): void {
 }
 
 export function removeOpencodeHooks(): void {
+  // Cancel any version decision still waiting on the probe: the user opted out (or
+  // uninstalled), and a late "1.x" answer must not re-plant what this removal deleted.
+  installGeneration++
   removeManaged(pluginPath())
   removeManaged(v2PluginPath())
   // The directory is ours by name; drop it only when nothing of anyone else's is left in it.

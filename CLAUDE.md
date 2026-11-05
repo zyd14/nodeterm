@@ -3616,9 +3616,21 @@ its agent status" under Hosted team relay.
   `{plugin,plugins}/*.{ts,js}` files, and up to **1.2.10 calls every export as a function** — an
   object default there throws and kills every opencode command on the machine, inside nodeterm or
   not (bisected: 1.2.10 crashes, 1.2.11 does not). So `plugins/nodeterm-status.js` keeps ONLY the
-  named 1.x export (2.x logs a harmless "failed to load plugin" WARN for it at every start) and 2.x
-  gets `plugins/nodeterm-status-v2/index.js`, a directory no 1.x glob matches. **Never add a default
-  export to the 1.x file**, and never "simplify" the pair back into one dual-shape file. A
+  named 1.x export and 2.x gets `plugins/nodeterm-status-v2/index.js`, a directory no 1.x glob
+  matches. **Never add a default export to the 1.x file**, and never "simplify" the pair back into
+  one dual-shape file. WHICH of the two is planted is gated on the installed CLI's major version
+  (`installOpencodeHooks` in `hooks/opencode.ts`: `opencode --version`, resolved through the
+  login-shell PATH, memoized, 5s-bounded, unknown on any failure): the 2.x directory plants
+  synchronously on every install (no 1.x glob can see it), while the 1.x FILE is decided after
+  the probe — planted where the CLI is 1.x or its version is UNKNOWN, never planted on a known
+  2.x, and a marker-managed copy an older nodeterm planted there is REMOVED (the upgrade
+  migration; a user's own file without the marker is never touched either way). The 1.x file is
+  deliberately not planted "for a moment" before the probe answers: 2.x rejects it at load with
+  the "failed to load plugin" WARN and watches plugin files for reload, so plant-then-remove
+  would WARN on every launch of a 2.x machine. The async decision is fire-and-forget at boot
+  (never awaited — no startup delay) and is generational: `removeOpencodeHooks()` (the
+  opt-out/uninstall path) cancels any decision still waiting on the probe, so a late "1.x"
+  answer cannot re-plant files the user just asked to have removed. A
   process-wide latch (`Symbol.for('nodeterm.opencode.status.api')`, keyed by API, not by call)
   keeps a process that runs both from posting twice. The 2.x plugin translates its event stream to
   the 1.x wire names (`session.execution.started` → user `message.updated`, `…succeeded|interrupted`

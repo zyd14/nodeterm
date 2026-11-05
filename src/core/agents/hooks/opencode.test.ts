@@ -8,7 +8,9 @@ import {
   buildOpencodeV2Plugin,
   installOpencodeHooks,
   opencodeConfigDir,
+  opencodeMajorFrom,
   pluginPath,
+  probeOpencodeMajorAt,
   removeOpencodeHooks,
   v2PluginPath
 } from './opencode'
@@ -38,23 +40,48 @@ afterEach(() => {
 
 const planted = () => path.join(tmp, '.config', 'opencode', 'plugins', 'nodeterm-status.js')
 
+/** The version probe as a controlled answer. Every policy test injects one: the DEFAULT probe
+ *  (the memoized real `opencodeMajor()`) resolves the login shell and may spawn the machine's
+ *  real opencode — which these tests must never do. */
+const versionProbe = (major: number | null) => () => Promise.resolve(major)
+
+/** A probe that stays pending until the test lands it, so the synchronous install pass can be
+ *  asserted exactly as a machine sees it at boot: the 2.x directory planted, the 1.x file not
+ *  yet decided. Same shape as the antigravity probe tests: the promise exists EAGERLY (the
+ *  implementation defers calling the probe by a microtask, so a lazily-created one could never
+ *  be resolved by the time the test lands its answer). */
+function deferredProbe(): {
+  probe: () => Promise<number | null>
+  resolve: (major: number | null) => void
+  reject: (e: Error) => void
+} {
+  let settle!: (major: number | null) => void
+  let fail!: (e: Error) => void
+  const pending = new Promise<number | null>((res, rej) => {
+    settle = res
+    fail = rej
+  })
+  return { probe: () => pending, resolve: (major) => settle(major), reject: (e) => fail(e) }
+}
+
 describe('opencode plugin install', () => {
-  it('writes the marker-bearing plugin file (idempotent)', () => {
-    installOpencodeHooks()
-    installOpencodeHooks()
+  it('writes the marker-bearing 1.x plugin once the probe decides 1.x (idempotent)', async () => {
+    await installOpencodeHooks(versionProbe(1))
+    await installOpencodeHooks(versionProbe(1))
     const body = fs.readFileSync(planted(), 'utf8')
     expect(body.startsWith(PLUGIN_MARKER)).toBe(true)
     expect(body).toContain('NODETERM_NODE_ID')
     expect(body).toContain('/hook/opencode')
   })
-  it('never overwrites a user file without the marker', () => {
+  it('never overwrites a user 1.x file without the marker — on either side of the decision', async () => {
     fs.mkdirSync(path.dirname(planted()), { recursive: true })
     fs.writeFileSync(planted(), '// my own plugin\n')
-    installOpencodeHooks()
+    await installOpencodeHooks(versionProbe(1)) // the plant branch must not touch it
+    await installOpencodeHooks(versionProbe(2)) // the remove branch must not touch it
     expect(fs.readFileSync(planted(), 'utf8')).toBe('// my own plugin\n')
   })
-  it('remove deletes only a marker-bearing file', () => {
-    installOpencodeHooks()
+  it('remove deletes only a marker-bearing 1.x file', async () => {
+    await installOpencodeHooks(versionProbe(1))
     removeOpencodeHooks()
     expect(fs.existsSync(planted())).toBe(false)
     fs.mkdirSync(path.dirname(planted()), { recursive: true })
@@ -450,13 +477,13 @@ describe('generated plugin presents the per-node token', () => {
 })
 
 describe('opencodeConfigDir honors XDG_CONFIG_HOME', () => {
-  it('lands the plugin under $XDG_CONFIG_HOME/opencode when the (absolute) env var is set', () => {
+  it('lands the plugin under $XDG_CONFIG_HOME/opencode when the (absolute) env var is set', async () => {
     const xdg = fs.mkdtempSync(path.join(os.tmpdir(), 'nt-xdg-'))
     vi.stubEnv('XDG_CONFIG_HOME', xdg)
     try {
       expect(opencodeConfigDir()).toBe(path.join(xdg, 'opencode'))
       expect(pluginPath()).toBe(path.join(xdg, 'opencode', 'plugins', 'nodeterm-status.js'))
-      installOpencodeHooks()
+      await installOpencodeHooks(versionProbe(1))
       const body = fs.readFileSync(path.join(xdg, 'opencode', 'plugins', 'nodeterm-status.js'), 'utf8')
       expect(body.startsWith(PLUGIN_MARKER)).toBe(true)
       // and NOT under ~/.config
@@ -483,39 +510,171 @@ describe('opencodeConfigDir honors XDG_CONFIG_HOME', () => {
 const planted2 = () => path.join(tmp, '.config', 'opencode', 'plugins', 'nodeterm-status-v2', 'index.js')
 
 describe('opencode plugin install — the 2.x directory plugin', () => {
-  it('plants both plugins, each marker-bearing, at the paths each opencode generation loads', () => {
-    installOpencodeHooks()
+  it('plants both plugins, each marker-bearing, at the paths each opencode generation loads', async () => {
+    await installOpencodeHooks(versionProbe(1))
     expect(v2PluginPath()).toBe(planted2())
     expect(fs.readFileSync(planted(), 'utf8')).toBe(buildOpencodePlugin())
     expect(fs.readFileSync(planted2(), 'utf8')).toBe(buildOpencodeV2Plugin())
     expect(fs.readFileSync(planted2(), 'utf8').startsWith(PLUGIN_MARKER)).toBe(true)
   })
-  it('refreshes a stale managed copy (an older build\'s body) but never a user file', () => {
+  it('refreshes a stale managed copy (an older build\'s body) but never a user file', async () => {
+    fs.mkdirSync(path.dirname(planted()), { recursive: true })
     fs.mkdirSync(path.dirname(planted2()), { recursive: true })
-    fs.writeFileSync(planted2(), PLUGIN_MARKER + '\n// old body\n')
-    installOpencodeHooks()
+    fs.writeFileSync(planted(), PLUGIN_MARKER + '\n// old v1 body\n')
+    fs.writeFileSync(planted2(), PLUGIN_MARKER + '\n// old v2 body\n')
+    await installOpencodeHooks(versionProbe(1))
+    expect(fs.readFileSync(planted(), 'utf8')).toBe(buildOpencodePlugin())
     expect(fs.readFileSync(planted2(), 'utf8')).toBe(buildOpencodeV2Plugin())
     fs.writeFileSync(planted2(), '// my own v2 plugin\n')
-    installOpencodeHooks()
+    await installOpencodeHooks(versionProbe(1))
     expect(fs.readFileSync(planted2(), 'utf8')).toBe('// my own v2 plugin\n')
   })
-  it('does not rewrite an up-to-date file (opencode 2.x watches plugin files and reloads on change)', () => {
-    installOpencodeHooks()
+  it('does not rewrite an up-to-date file (opencode 2.x watches plugin files and reloads on change)', async () => {
+    const d = deferredProbe()
+    const pending = installOpencodeHooks(d.probe)
     const past = Math.floor(Date.now() / 1000) - 60 // whole seconds: mtimeMs is a float
     fs.utimesSync(planted2(), past, past)
-    installOpencodeHooks()
+    d.resolve(1)
+    await pending
     expect(Math.round(fs.statSync(planted2()).mtimeMs / 1000)).toBe(past)
+    // and the decided 1.x file too: a second install with the same answer must not rewrite it
+    fs.utimesSync(planted(), past, past)
+    await installOpencodeHooks(versionProbe(1))
+    expect(Math.round(fs.statSync(planted()).mtimeMs / 1000)).toBe(past)
   })
-  it('remove deletes both managed plugins and the now-empty directory, but keeps anything else', () => {
-    installOpencodeHooks()
+  it('remove deletes both managed plugins and the now-empty directory, but keeps anything else', async () => {
+    await installOpencodeHooks(versionProbe(1))
     removeOpencodeHooks()
     expect(fs.existsSync(planted())).toBe(false)
     expect(fs.existsSync(path.dirname(planted2()))).toBe(false)
-    installOpencodeHooks()
+    await installOpencodeHooks(versionProbe(1))
     fs.writeFileSync(path.join(path.dirname(planted2()), 'notes.txt'), 'mine')
     removeOpencodeHooks()
     expect(fs.existsSync(planted2())).toBe(false)
     expect(fs.readFileSync(path.join(path.dirname(planted2()), 'notes.txt'), 'utf8')).toBe('mine')
+  })
+})
+
+// The version gate (the second half of the 2.x fix). The pair is planted by GENERATION of the
+// installed CLI: the 2.x directory always (it is invisible to every 1.x glob), the 1.x FILE
+// only where the installed CLI is 1.x or its version is unknown — never planted "for a moment"
+// on a known 2.x, which WARNs on the file at every load and reloads on every change.
+describe('opencode install — the version-gated 1.x file', () => {
+  it('plants the 2.x directory synchronously and holds the 1.x file until the version is known', async () => {
+    const d = deferredProbe()
+    const pending = installOpencodeHooks(d.probe)
+    expect(fs.readFileSync(planted2(), 'utf8').startsWith(PLUGIN_MARKER)).toBe(true) // armed at once
+    expect(fs.existsSync(planted())).toBe(false) // NOT even temporarily planted on an unknown box
+    d.resolve(1)
+    await pending
+    expect(fs.existsSync(planted())).toBe(true)
+  })
+
+  it('known 2.x never plants the 1.x file, and migrates away the managed copy an older nodeterm left', async () => {
+    // The upgrade path: every nodeterm before this gate planted the 1.x file unconditionally.
+    fs.mkdirSync(path.dirname(planted()), { recursive: true })
+    fs.writeFileSync(planted(), PLUGIN_MARKER + '\n// the old unconditional 1.x body\n')
+    await installOpencodeHooks(versionProbe(2))
+    expect(fs.existsSync(planted())).toBe(false) // marker-managed legacy copy removed
+    expect(fs.readFileSync(planted2(), 'utf8').startsWith(PLUGIN_MARKER)).toBe(true) // 2.x armed
+  })
+
+  it('known 2.x leaves a user\'s own 1.x file exactly as it was (no marker → not ours to remove)', async () => {
+    fs.mkdirSync(path.dirname(planted()), { recursive: true })
+    fs.writeFileSync(planted(), '// my own plugin\n')
+    await installOpencodeHooks(versionProbe(2))
+    expect(fs.readFileSync(planted(), 'utf8')).toBe('// my own plugin\n')
+  })
+
+  it('known 1.x plants the 1.x file — a 2.x→1.x downgrade is not stranded badge-less', async () => {
+    await installOpencodeHooks(versionProbe(2)) // a previous launch decided 2.x: the file is gone
+    expect(fs.existsSync(planted())).toBe(false)
+    await installOpencodeHooks(versionProbe(1)) // the user downgraded opencode
+    expect(fs.readFileSync(planted(), 'utf8')).toBe(buildOpencodePlugin())
+  })
+
+  it('unknown version (no CLI found, timeout, unreadable output) plants the 1.x file conservatively', async () => {
+    // Conservative = today's behavior: every <=1.x machine keeps its badge even when the probe
+    // cannot answer, at the cost of the harmless load WARN on a 2.x machine.
+    await installOpencodeHooks(versionProbe(null))
+    expect(fs.readFileSync(planted(), 'utf8')).toBe(buildOpencodePlugin())
+  })
+
+  it('a probe that rejects is contained and treated as unknown: v1 planted, install never rejects', async () => {
+    await installOpencodeHooks(() => Promise.reject(new Error('probe boom')))
+    expect(fs.readFileSync(planted(), 'utf8')).toBe(buildOpencodePlugin())
+  })
+
+  it('a decision still pending behind a remove/opt-out writes nothing afterwards', async () => {
+    const d = deferredProbe()
+    const pending = installOpencodeHooks(d.probe) // launch-time install, probe still in flight
+    removeOpencodeHooks() // the user declines opencode in Settings (or uninstalls)
+    d.resolve(1) // a late "1.x" answer must NOT re-plant what the opt-out deleted
+    await pending
+    expect(fs.existsSync(planted())).toBe(false)
+    expect(fs.existsSync(planted2())).toBe(false)
+    expect(fs.existsSync(path.dirname(planted2()))).toBe(false)
+  })
+
+  it('a NEW install after the opt-out still plants (the gate cancels only superseded decisions)', async () => {
+    const d = deferredProbe()
+    const stale = installOpencodeHooks(d.probe)
+    removeOpencodeHooks()
+    d.resolve(1)
+    await stale
+    await installOpencodeHooks(versionProbe(1)) // re-enabled: a fresh generation may plant again
+    expect(fs.readFileSync(planted(), 'utf8')).toBe(buildOpencodePlugin())
+    expect(fs.readFileSync(planted2(), 'utf8')).toBe(buildOpencodeV2Plugin())
+  })
+})
+
+// The probe that feeds the gate. `opencodeMajorFrom` is the pure decision input;
+// `probeOpencodeMajorAt` runs a FAKE CLI from a temp dir (never the machine's real opencode —
+// a sh script printing the measured `--version` line), so the spawn/exit-code plumbing is
+// exercised without touching any real installation.
+describe('opencodeMajorFrom — the version parser', () => {
+  it('reads the measured `--version` shapes', () => {
+    expect(opencodeMajorFrom('opencode v2.2.5\n')).toBe(2) // MEASURED, 2026-11-05, exit 0
+    expect(opencodeMajorFrom('2.0.30')).toBe(2)
+    expect(opencodeMajorFrom('1.18.3')).toBe(1)
+    expect(opencodeMajorFrom('1.2.10')).toBe(1) // the last call-every-export-as-a-function build
+  })
+  it('answers null — "unknown", the conservative branch — for anything it cannot read a version out of', () => {
+    expect(opencodeMajorFrom('opencode: command not found')).toBeNull()
+    expect(opencodeMajorFrom('')).toBeNull()
+    expect(opencodeMajorFrom('   ')).toBeNull()
+    expect(opencodeMajorFrom(null)).toBeNull()
+    expect(opencodeMajorFrom(undefined)).toBeNull()
+  })
+})
+
+describe.skipIf(process.platform === 'win32')('probeOpencodeMajorAt — the bounded CLI probe', () => {
+  let dir: string
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nt-oc-probe-'))
+  })
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+
+  /** A fake `opencode` binary: prints the given `--version` line (the real CLI's measured shape). */
+  const fakeBin = (line: string, exit = 0): string => {
+    const bin = path.join(dir, 'opencode')
+    fs.writeFileSync(bin, `#!/bin/sh\necho '${line}'\nexit ${exit}\n`)
+    fs.chmodSync(bin, 0o755)
+    return bin
+  }
+
+  it('answers the major the CLI printed on stdout', async () => {
+    expect(await probeOpencodeMajorAt(fakeBin('opencode v2.2.5'))).toBe(2)
+    expect(await probeOpencodeMajorAt(fakeBin('opencode 1.18.3'))).toBe(1)
+  })
+  it('answers null when there is no version to read, or the CLI exits non-zero', async () => {
+    expect(await probeOpencodeMajorAt(fakeBin('command not found'))).toBeNull()
+    expect(await probeOpencodeMajorAt(fakeBin('opencode v2.2.5', 1))).toBeNull()
+  })
+  it('answers null when no binary exists at the path', async () => {
+    expect(await probeOpencodeMajorAt(path.join(dir, 'missing'))).toBeNull()
   })
 })
 
