@@ -562,6 +562,79 @@ describe('opencode plugin install — consolidated file + legacy two-artifact mi
     expect(fs.existsSync(legacyDir())).toBe(false)
   })
 
+  it('retains the legacy fallback when a real directory occupies the primary path', () => {
+    fs.mkdirSync(legacyDir(), { recursive: true })
+    const legacyBody = PLUGIN_MARKER + '\n// old 2.x body\n'
+    fs.writeFileSync(legacyIndex(), legacyBody)
+    fs.mkdirSync(planted())
+    fs.writeFileSync(path.join(planted(), 'notes.txt'), 'mine')
+
+    expect(() => installOpencodeHooks()).toThrow(expect.objectContaining({ code: 'EISDIR' }))
+    expect(fs.readFileSync(legacyIndex(), 'utf8')).toBe(legacyBody)
+    expect(fs.statSync(legacyDir()).isDirectory()).toBe(true)
+    expect(fs.statSync(planted()).isDirectory()).toBe(true)
+    expect(fs.readFileSync(path.join(planted(), 'notes.txt'), 'utf8')).toBe('mine')
+  })
+
+  it.each(['absent', 'managed'] as const)('retains the legacy fallback when writing the %s primary fails', (primary) => {
+    const primaryBody = PLUGIN_MARKER + '\n// old 1.x body\n'
+    const legacyBody = PLUGIN_MARKER + '\n// old 2.x body\n'
+    plantLegacyLayout(primaryBody, legacyBody)
+    if (primary === 'absent') fs.rmSync(planted())
+    const write = fs.writeFileSync
+    // A targeted filesystem failure is deterministic even when the runner can bypass mode bits.
+    vi.spyOn(fs, 'writeFileSync').mockImplementation((file, ...args) => {
+      if (file === planted()) throw Object.assign(new Error('primary write denied'), { code: 'EACCES' })
+      return write(file, ...args)
+    })
+
+    expect(() => installOpencodeHooks()).toThrow(expect.objectContaining({ code: 'EACCES' }))
+    expect(fs.readFileSync(legacyIndex(), 'utf8')).toBe(legacyBody)
+    expect(fs.statSync(legacyDir()).isDirectory()).toBe(true)
+    if (primary === 'managed') expect(fs.readFileSync(planted(), 'utf8')).toBe(primaryBody)
+    else expect(fs.existsSync(planted())).toBe(false)
+  })
+
+  it('leaves all data untouched when the canonical file cannot be read for a non-ENOENT reason', () => {
+    const primaryBody = '// my own unreadable plugin\n'
+    const legacyBody = PLUGIN_MARKER + '\n// old 2.x body\n'
+    plantLegacyLayout(primaryBody, legacyBody)
+    fs.writeFileSync(path.join(legacyDir(), 'notes.txt'), 'mine')
+    const read = fs.readFileSync
+    // Inject only the primary read: all fixture data and legacy reads remain real filesystem IO.
+    const unreadable = vi.spyOn(fs, 'readFileSync').mockImplementation((file, ...args) => {
+      if (file === planted()) throw Object.assign(new Error('primary read denied'), { code: 'EACCES' })
+      return read(file, ...args)
+    })
+
+    expect(() => installOpencodeHooks()).toThrow(expect.objectContaining({ code: 'EACCES' }))
+    unreadable.mockRestore()
+    expect(fs.readFileSync(planted(), 'utf8')).toBe(primaryBody)
+    expect(fs.readFileSync(legacyIndex(), 'utf8')).toBe(legacyBody)
+    expect(fs.readFileSync(path.join(legacyDir(), 'notes.txt'), 'utf8')).toBe('mine')
+  })
+
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    'retains the legacy fallback in a real read-only plugins directory',
+    () => {
+      fs.mkdirSync(legacyDir(), { recursive: true })
+      const legacyBody = PLUGIN_MARKER + '\n// old 2.x body\n'
+      fs.writeFileSync(legacyIndex(), legacyBody)
+      const pluginsDir = path.dirname(planted())
+      const mode = fs.statSync(pluginsDir).mode
+      fs.chmodSync(pluginsDir, 0o555)
+      try {
+        expect(() => installOpencodeHooks()).toThrow(expect.objectContaining({ code: 'EACCES' }))
+        expect(fs.readFileSync(legacyIndex(), 'utf8')).toBe(legacyBody)
+        expect(fs.statSync(legacyDir()).isDirectory()).toBe(true)
+        expect(fs.existsSync(planted())).toBe(false)
+      } finally {
+        // Restore access even on RED so fixture cleanup never leaks a read-only directory.
+        fs.chmodSync(pluginsDir, mode)
+      }
+    }
+  )
+
   it('completes the migration lazily once the user removes their own file', () => {
     plantLegacyLayout('// my own plugin\n', PLUGIN_MARKER + '\n// old 2.x body\n')
     installOpencodeHooks() // retained — the previous test's policy

@@ -3637,8 +3637,11 @@ its agent status" under Hosted team relay.
   WARNed at every 2.x load — "failed to load plugin … must export a default definition" — and
   2.x watches plugin files and reloads on change), and one artifact both generations load needs
   no choosing; a 1.x machine's badge no longer depends on a probe succeeding either. Install
-  order is deliberate — remove the old artifacts BEFORE planting, so a 2.x machine never holds
-  two same-id v2 plugins at once. **Migration off the old pair is marker-gated** (`PLUGIN_MARKER`
+  order is deliberate — successfully plant/confirm the canonical file BEFORE retiring the old
+  v2 fallback, so a read/write failure cannot strand the badge. Only `ENOENT` means the canonical
+  slot is absent; other read errors leave everything untouched. Filesystem ordering does not
+  guarantee when a running loader unloads a plugin; transient reload behavior is unmeasured.
+  **Migration off the old pair is marker-gated** (`PLUGIN_MARKER`
   must be the first line): a managed old `nodeterm-status.js` (the named-export v1 body) is
   refreshed into the consolidated module (byte-identical means no write — no watcher churn), a
   marker-managed `nodeterm-status-v2/index.js` is removed and its directory dropped only when

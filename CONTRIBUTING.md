@@ -1438,10 +1438,13 @@ https://opencode.ai/v2/docs/build/plugins/migrate-v1); older v1 is unsupported â
 every export as a function and dies on a default object, for every command on the machine.
 Install is synchronous and probe-free (no `opencode --version` gate); migration off the old
 file + directory pair is marker-gated and never touches a user's own file â€” when the canonical
-slot is user-owned, the managed old v2 fallback is retained rather than stranded. The v2 adapter
-arms inside the shared `serve --service` server (the only process that loads plugins on 2.x); its
-env belongs to the pane that started it, so multi-pane attribution is imprecise. See CLAUDE.md
-for the measurements.
+slot is user-owned, the managed old v2 fallback is retained rather than stranded. Successfully
+plant/confirm the canonical file before retiring that fallback; only `ENOENT` means absent, and
+other read errors or failed writes must leave the legacy artifacts intact. Filesystem deletion
+does not guarantee immediate unloading by a running loader; transient reload behavior is unmeasured.
+The v2 adapter arms inside the shared `serve --service` server (the only process that loads plugins
+on 2.x); its env belongs to the pane that started it, so multi-pane attribution is imprecise. See
+CLAUDE.md for the measurements.
 
 Claude/Gemini settings must go through the guarded transactions in
 `src/core/agents/hooks/{settings-file,remote-settings-file}.ts`. Confirmed absence or a successfully read empty/whitespace file may start from `{}`;

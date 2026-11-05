@@ -351,20 +351,26 @@ export default {
 `
 }
 
-/** Write `body` to `file` unless a file WITHOUT our marker is there (a user's own — never
- *  touched; the read follows symlinks, so a user's link to their own file is equally safe).
+/** Confirm or write the canonical plugin before allowing legacy fallback cleanup.
+ *  The read follows symlinks, preserving the existing user-owned target protection.
  *  A byte-identical body is not rewritten: opencode 2.x watches plugin files and reloads on
- *  change, so an unchanged second install must not touch mtime. */
-function plantManaged(file: string, body: string): void {
+ *  change, so an unchanged second install must not touch mtime.
+ *  @param file Canonical plugin path whose ownership must be checked before writing.
+ *  @param body Marker-bearing consolidated module to publish.
+ *  @returns Whether the canonical file is current; false means the slot is user-owned.
+ */
+function plantManaged(file: string, body: string): boolean {
   try {
     const existing = fs.readFileSync(file, 'utf8')
-    if (!existing.startsWith(PLUGIN_MARKER)) return
-    if (existing === body) return
-  } catch {
-    /* absent — plant it */
+    if (!existing.startsWith(PLUGIN_MARKER)) return false
+    if (existing === body) return true
+  } catch (error) {
+    // Only ENOENT proves absence; unreadable or invalid paths must retain the legacy fallback.
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
   }
   fs.mkdirSync(path.dirname(file), { recursive: true })
   fs.writeFileSync(file, body, 'utf8')
+  return true
 }
 
 /** Remove `file` only when it is marker-managed. Deletions act on the path itself: a symlink
@@ -391,19 +397,17 @@ function removeManaged(file: string): void {
  *     2.x machine nodeterm previously served (on 1.x the legacy directory costs nothing —
  *     the v1.18.29 glob loads files only). The next install after the user removes their own
  *     file completes the migration lazily.
- *  2. Otherwise retire the legacy v2 artifacts FIRST — marker-gated index removal, then
- *     rmdir of the directory only when empty — BEFORE planting, so no 2.x process ever runs
- *     two same-id plugins at once.
- *  3. Plant/refresh the consolidated file at the primary path (marker-gated; byte-identical
- *     writes are skipped, so a second install never touches mtime — 2.x reloads on change).
+ *  2. Otherwise plant/confirm the consolidated file first (marker-gated; byte-identical writes
+ *     are skipped, so a second install never touches mtime — 2.x reloads on change). Only ENOENT
+ *     counts as absence; any other read failure or a failed write propagates before cleanup.
+ *  3. After successful publication, retire the marker-managed legacy v2 index and rmdir its
+ *     directory only when empty. This preserves a working fallback if publication fails;
+ *     filesystem ordering does not guarantee when a running loader unloads a plugin.
+ *
+ * Takes no arguments; paths are resolved from the current configuration environment.
  */
 export function installOpencodeHooks(): void {
-  try {
-    const primary = fs.readFileSync(pluginPath(), 'utf8')
-    if (!primary.startsWith(PLUGIN_MARKER)) return
-  } catch {
-    /* absent — the path is free; plant below */
-  }
+  if (!plantManaged(pluginPath(), buildOpencodePlugin())) return
   removeManaged(legacyV2PluginPath())
   try {
     // The directory is ours by name; drop it only when nothing of anyone else's is left in it.
@@ -411,7 +415,6 @@ export function installOpencodeHooks(): void {
   } catch {
     /* absent, or not empty (a user's file survives) — leave it */
   }
-  plantManaged(pluginPath(), buildOpencodePlugin())
 }
 
 /** Remove everything nodeterm manages at BOTH the consolidated path and the legacy ones —
