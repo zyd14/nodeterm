@@ -17,6 +17,10 @@ export const MANAGED_HOOK_INSTALLERS: readonly HookInstaller[] = [
   ['claude', installClaudeHooks],
   ['codex', installCodexHooks],
   ['gemini', installGeminiHooks],
+  // opencode's hook seam is its PLUGIN system, not a config file: ONE marker-gated
+  // consolidated plugin (src/core/agents/hooks/opencode.ts) whose default export serves both
+  // loader generations — v1 calls server(), v2 calls setup(ctx) — so which one runs it is
+  // decided at load time and the install itself is a plain synchronous plant/migrate.
   ['opencode', installOpencodeHooks],
   ['grok', installGrokHooks],
   ['copilot', installCopilotHooks],

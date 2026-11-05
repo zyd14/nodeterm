@@ -1202,8 +1202,11 @@ Lifecycle, by intent:
     last probe answer for both. The SSH mirror slice carries the host's `true` to the phone.
   - `codex exec` (commit messages), `login`, `mcp` and `app-server` take no such flag and are not
     TUI clients of the daemon. The phone gets `MirrorSettings.codexNoDaemon`, local and per SSH slice (iOS
-    reader: follow-up, @eneskirca). opencode was checked the same way: no published release has `serve --service`
-    (latest 1.18.33 and the `dev` channel), and a plain TUI leaves no process behind.
+    reader: follow-up, @eneskirca). opencode was checked the same way, against its v1 line (latest
+    1.18.33 and the `dev` channel): no `serve --service`, and a plain TUI left no process behind.
+    2.x later grew exactly that shared server — the opencode status plugin arms in it (see the
+    opencode passage under Agent support → hook installers) — so the v1-era answer no longer
+    describes a 2.x machine.
   - **Residuals, stated:** (1) a `codex` TYPED into a pane rather than launched by us — by hand in a
     plain terminal, or by an agent through `open-terminal --cmd codex` / `write` — carries that
     node's `NODETERM_NODE_ID` and, on 0.157+, can still start the account's daemon with it; managed
@@ -3609,29 +3612,67 @@ its agent status" under Hosted team relay.
   installer needs is why events are typed `ManagedHookEvent` (`string | {event, matcher}`): grok's
   tool matcher is a REGEX and must be `.*` — a bare `*` is invalid and silently stops tool events
   firing. Plain-string events keep their byte-identical output for every other agent.
-  **opencode gets TWO plugin files, because no single module loads on both of its generations**
-  (issue #1136, `hooks/opencode.ts`, measured 2026-10-16 on @opencode/cli 2.0.30 and opencode-ai
-  1.1.4 / 1.2.10 / 1.18.28 / 1.18.33). 2.x accepts only a default export OBJECT `{ id, setup }` (a
-  function default is refused) and loads `plugins/*.js` and plugin DIRECTORIES; 1.x loads only
-  `{plugin,plugins}/*.{ts,js}` files, and up to **1.2.10 calls every export as a function** — an
-  object default there throws and kills every opencode command on the machine, inside nodeterm or
-  not (bisected: 1.2.10 crashes, 1.2.11 does not). So `plugins/nodeterm-status.js` keeps ONLY the
-  named 1.x export (2.x logs a harmless "failed to load plugin" WARN for it at every start) and 2.x
-  gets `plugins/nodeterm-status-v2/index.js`, a directory no 1.x glob matches. **Never add a default
-  export to the 1.x file**, and never "simplify" the pair back into one dual-shape file. A
-  process-wide latch (`Symbol.for('nodeterm.opencode.status.api')`, keyed by API, not by call)
-  keeps a process that runs both from posting twice. The 2.x plugin translates its event stream to
-  the 1.x wire names (`session.execution.started` → user `message.updated`, `…succeeded|interrupted`
-  → `session.idle`, `…failed` → `session.error`, `form.*` → `question.*`), so `normalizeOpencode` has
-  one dialect, and it drops a subagent child session's turn events (forwarding its permission/form
-  under the root session). **It refuses to run inside 2.x's shared background server**
-  (`serve --service`, argv): by default every 2.x CLI talks to ONE server that keeps the env of
-  whichever pane started it and outlives it — measured, a second pane's events carried the first
-  pane's `NODETERM_NODE_ID` — so posting from it would paint one node's status on another (the
-  codex `--no-daemon` problem). Only a `--standalone` server (the pane's own `serve --stdio` child)
-  reports, so **2.x status needs `opencode --standalone`**; nodeterm does not pass it yet (1.x exits
-  on the unknown flag, so it needs a codex-style `--help` probe — follow-up), and until then the
-  Launch commands override (`opencode --standalone`) is the user's switch.
+  **opencode gets ONE plugin file — a single module that serves BOTH generations** (issue #1136,
+  `hooks/opencode.ts`): an auto-discovered `~/.config/opencode/plugins/nodeterm-status.js` whose
+  default export is an object `{ id, server, setup }` — v1 dispatches `server()` (its object
+  entrypoint), v2 dispatches `setup(ctx)`, and both adapters wrap ONE shared poster/prelude. That
+  dual-version export is the bridge OpenCode documents for exactly this
+  (https://opencode.ai/v2/docs/build/plugins/migrate-v1, "Support V1 and V2 from one package"),
+  and the file is a FILE, not a directory, because the two loaders meet only there: 2.x
+  auto-discovers direct `.js` files AND plugin directories under `plugins/` but accepts only a
+  default export OBJECT (a function default is refused — "Expected object", measured on
+  @opencode/cli 2.0.30; the extra `server` key is the documented hybrid shape), while 1.x
+  discovers only `{plugin,plugins}/*.{ts,js}` FILES (verified 2026-11-05 against the 1.18.29
+  loader source) — the old v2 plugin was a DIRECTORY precisely because no 1.x glob could see it.
+  **The support floor is v1 >= 1.18.29 or v2** — the first v1 that accepts object entrypoints,
+  per the same doc. Older v1 is deliberately UNSUPPORTED: up to **1.2.10 it calls every export as
+  a function**, so an object default throws and kills every opencode command on the machine,
+  inside nodeterm or not (bisected: 1.2.10 crashes, 1.2.11 does not), and 2.x refuses a callable
+  default — no single module can reach that far down. The file + directory pair that used to
+  cover old v1 was dropped on purpose (the docs' own advice for pre-1.18.29 v1 is separate
+  entrypoints, the exact shape this consolidation removes); do not re-split the module to chase
+  it. **Planting is synchronous and unconditional** (`installOpencodeHooks(): void` — no
+  `opencode --version` probe, no async decision, no install-generation cancellation): the probe
+  machinery existed only to choose between two mutually exclusive artifacts (the old 1.x file
+  WARNed at every 2.x load — "failed to load plugin … must export a default definition" — and
+  2.x watches plugin files and reloads on change), and one artifact both generations load needs
+  no choosing; a 1.x machine's badge no longer depends on a probe succeeding either. Install
+  order is deliberate — successfully plant/confirm the canonical file BEFORE retiring the old
+  v2 fallback, so a read/write failure cannot strand the badge. Only `ENOENT` means the canonical
+  slot is absent; other read errors leave everything untouched. Filesystem ordering does not
+  guarantee when a running loader unloads a plugin; transient reload behavior is unmeasured.
+  **Migration off the old pair is marker-gated** (`PLUGIN_MARKER`
+  must be the first line): a managed old `nodeterm-status.js` (the named-export v1 body) is
+  refreshed into the consolidated module (byte-identical means no write — no watcher churn), a
+  marker-managed `nodeterm-status-v2/index.js` is removed and its directory dropped only when
+  empty, and a user's own file — no marker — is never touched, nor is an unrelated file in the
+  legacy directory. The one collision, a user-owned file in the canonical slot, resolves the
+  conservative way: touch NOTHING and RETAIN a marker-managed old v2 directory beside it —
+  removing it would strand the badge on a 2.x machine nodeterm used to serve, while on 1.x a
+  retained directory costs nothing (no 1.x glob matches it); with no old v2 either, nothing is
+  planted (the same posture as before for user-owned slots), and the migration completes lazily
+  at the first install after the user's file is gone. `removeOpencodeHooks()` (the
+  opt-out/uninstall path) is marker-safe across the consolidated file and both legacy locations.
+  The poster keeps its gates: no `NODETERM_NODE_ID`, no posting (inert outside a
+  nodeterm-spawned session), the endpoint FILE is re-read per POST for the live port/token (env
+  fallback, per-node token, unix-socket transport), and a process-wide latch
+  (`Symbol.for('nodeterm.opencode.status.api')`, keyed by API, not by call)
+  keeps a process that somehow runs both entrypoints from posting twice. The v2 adapter translates
+  its event stream to the 1.x wire names (`session.execution.started` → user `message.updated`,
+  `…succeeded|interrupted` → `session.idle`, `…failed` → `session.error`, `form.*` →
+  `question.*`), so `normalizeOpencode` has one dialect, and it drops a subagent child session's
+  turn events (forwarding its permission/form under the root session). **It arms in 2.x's shared background server (`serve --service`) too**:
+  by default every 2.x CLI talks to ONE server that keeps the env of whichever pane started it and
+  outlives it — measured, a second pane's events carried the first pane's `NODETERM_NODE_ID` — so
+  posting from it paints one node's status on another (the codex `--no-daemon` problem). It used
+  to refuse to run there so the 1.x file beside it could report instead, but that yield was
+  sound only while both generations could load: 2.x rejects the 1.x file at load and loads
+  plugins ONLY in serve processes (measured in the field across 2.1.3–2.2.5, Nov 2026), so every
+  long-lived server on a nodeterm machine is the managed `serve --service` — the refusal left no
+  subscriber anywhere and the badge froze. The accepted trade: posts carry the server's own
+  `NODETERM_NODE_ID`, so multi-pane attribution is imprecise while a single active pane is exact;
+  an `opencode --standalone` launch override still pins a pane's own env when a user wants that
+  precision, but it is a switch, not a requirement.
   **Codex is the one agent whose hook command is NOT a POSIX one-liner on Windows** (issue #567):
   it builds the command as `cmd.exe /C <string>` (`codex-rs/hooks/src/engine/command_runner.rs`,
   rust-v0.151.0) unless the session has a shell configured, which a default Windows install has

@@ -76,6 +76,7 @@ Hook-driven status — no output scraping: pulsing **RUNNING / NEEDS YOU** badge
 **subagent** cards with live transcripts, a per-node **context meter**, and OS
 notifications. Click the ping, answer the permission prompt right in the node, and get
 told the moment the turn is **done**. On a MacBook, agents live in the **notch** too.
+Status badges for opencode need OpenCode 1.18.29+ or 2.x.
 
 </td>
 <td><img src="docs/assets/agents-tour.webp" alt="Agent status — subagent fan-out with a context meter; a permission prompt lights the notch and posts a macOS notification; Go jumps to the node; ✓ Approve in its header" /></td>

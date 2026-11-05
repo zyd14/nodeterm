@@ -1430,12 +1430,21 @@ silently enabled every agent on a fresh install's second boot (#1149). Only a no
 `~/.nodeterm/agent-hooks/` counts, and only on an install's first boot (the fresh-install marker). Do not merge text into `AGENTS.md` / `GEMINI.md` — agents get skills (progressive disclosure)
 instead; the old blocks crowded codex's 32 KiB instruction budget.
 
-**opencode has two managed plugins and they must stay two** (issue #1136): the 1.x file
-`plugins/nodeterm-status.js` exports ONLY the named function — opencode <= 1.2.10 calls every export
-as a function and dies on a default object, for every command on the machine — and 2.x gets the
-directory `plugins/nodeterm-status-v2/`, which no 1.x loads. The 2.x plugin stays silent inside the
-shared `serve --service` server (its env belongs to another pane); see CLAUDE.md for the
-measurements.
+**opencode's status plugin is ONE managed file, not a pair** (issue #1136): a single
+auto-discovered `plugins/nodeterm-status.js` whose default object `{ id, server, setup }` carries
+both adapters — v1 dispatches `server()`, v2 dispatches `setup(ctx)` — around one shared poster.
+That needs opencode **v1 >= 1.18.29 or v2** (the documented object-entrypoint floor,
+https://opencode.ai/v2/docs/build/plugins/migrate-v1); older v1 is unsupported — <= 1.2.10 calls
+every export as a function and dies on a default object, for every command on the machine.
+Install is synchronous and probe-free (no `opencode --version` gate); migration off the old
+file + directory pair is marker-gated and never touches a user's own file — when the canonical
+slot is user-owned, the managed old v2 fallback is retained rather than stranded. Successfully
+plant/confirm the canonical file before retiring that fallback; only `ENOENT` means absent, and
+other read errors or failed writes must leave the legacy artifacts intact. Filesystem deletion
+does not guarantee immediate unloading by a running loader; transient reload behavior is unmeasured.
+The v2 adapter arms inside the shared `serve --service` server (the only process that loads plugins
+on 2.x); its env belongs to the pane that started it, so multi-pane attribution is imprecise. See
+CLAUDE.md for the measurements.
 
 Claude/Gemini settings must go through the guarded transactions in
 `src/core/agents/hooks/{settings-file,remote-settings-file}.ts`. Confirmed absence or a successfully read empty/whitespace file may start from `{}`;
