@@ -537,10 +537,11 @@ describe('opencode plugin install — the 2.x directory plugin', () => {
     d.resolve(1)
     await pending
     expect(Math.round(fs.statSync(planted2()).mtimeMs / 1000)).toBe(past)
-    // and the decided 1.x file too: a second install with the same answer must not rewrite it
+    // A second install must preserve both files: rewriting either triggers plugin watchers.
     fs.utimesSync(planted(), past, past)
     await installOpencodeHooks(versionProbe(1))
     expect(Math.round(fs.statSync(planted()).mtimeMs / 1000)).toBe(past)
+    expect(Math.round(fs.statSync(planted2()).mtimeMs / 1000)).toBe(past)
   })
   it('remove deletes both managed plugins and the now-empty directory, but keeps anything else', async () => {
     await installOpencodeHooks(versionProbe(1))
