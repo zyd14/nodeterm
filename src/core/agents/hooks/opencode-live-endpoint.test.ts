@@ -43,7 +43,8 @@ describe('opencode plugin against the real endpoint-file writer', () => {
     const file = path.join(tmp, 'plugin-live.mjs')
     fs.writeFileSync(file, buildOpencodePlugin())
     const mod = await import(/* @vite-ignore */ `file://${file}`)
-    const hooks = await mod.NodetermStatus()
+    // The v1 dispatch the 1.18.29 loader performs on the default export.
+    const hooks = await mod.default.server()
     await hooks.event({ event: { type: 'session.idle', properties: { sessionID: 'ses_live' } } })
 
     // The listener fires only for an ACCEPTED post — a quote-mangled token is 401'd before it.

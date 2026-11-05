@@ -17,11 +17,11 @@ export const MANAGED_HOOK_INSTALLERS: readonly HookInstaller[] = [
   ['claude', installClaudeHooks],
   ['codex', installCodexHooks],
   ['gemini', installGeminiHooks],
-  // v2 plants synchronously; whether the 1.x FILE also plants is decided asynchronously by the
-  // opencode version probe (opencode.ts) — never awaited here (boot stays nonblocking) and the
-  // decision can no longer write anything once a remove/opt-out ran. installOpencodeHooks
-  // contains its own async errors, so the `void` wrapper is purely the registry's () => void.
-  ['opencode', () => void installOpencodeHooks()],
+  // opencode's hook seam is its PLUGIN system, not a config file: ONE marker-gated
+  // consolidated plugin (src/core/agents/hooks/opencode.ts) whose default export serves both
+  // loader generations — v1 calls server(), v2 calls setup(ctx) — so which one runs it is
+  // decided at load time and the install itself is a plain synchronous plant/migrate.
+  ['opencode', installOpencodeHooks],
   ['grok', installGrokHooks],
   ['copilot', installCopilotHooks],
   // Writes the GLOBAL ~/.gemini/config/hooks.json: a synchronous gate in front of every agy tool

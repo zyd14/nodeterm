@@ -5,19 +5,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   PLUGIN_MARKER,
   buildOpencodePlugin,
-  buildOpencodeV2Plugin,
   installOpencodeHooks,
+  legacyV2PluginDir,
+  legacyV2PluginPath,
   opencodeConfigDir,
-  opencodeMajorFrom,
   pluginPath,
-  probeOpencodeMajorAt,
-  removeOpencodeHooks,
-  v2PluginPath
+  removeOpencodeHooks
 } from './opencode'
 import { normalizeOpencode } from '../../../shared/agents/normalize'
 
-// Both generated plugins share one process-wide latch (which plugin API armed first). Every test
-// loads fresh module copies into the SAME process, so the latch is reset before each one.
+// The generated plugin's adapters share one process-wide latch (which plugin API armed first).
+// Every test loads fresh module copies into the SAME process, so the latch is reset before each.
 const LATCH = Symbol.for('nodeterm.opencode.status.api')
 const g = globalThis as unknown as Record<symbol, unknown>
 
@@ -40,48 +38,23 @@ afterEach(() => {
 
 const planted = () => path.join(tmp, '.config', 'opencode', 'plugins', 'nodeterm-status.js')
 
-/** The version probe as a controlled answer. Every policy test injects one: the DEFAULT probe
- *  (the memoized real `opencodeMajor()`) resolves the login shell and may spawn the machine's
- *  real opencode — which these tests must never do. */
-const versionProbe = (major: number | null) => () => Promise.resolve(major)
-
-/** A probe that stays pending until the test lands it, so the synchronous install pass can be
- *  asserted exactly as a machine sees it at boot: the 2.x directory planted, the 1.x file not
- *  yet decided. Same shape as the antigravity probe tests: the promise exists EAGERLY (the
- *  implementation defers calling the probe by a microtask, so a lazily-created one could never
- *  be resolved by the time the test lands its answer). */
-function deferredProbe(): {
-  probe: () => Promise<number | null>
-  resolve: (major: number | null) => void
-  reject: (e: Error) => void
-} {
-  let settle!: (major: number | null) => void
-  let fail!: (e: Error) => void
-  const pending = new Promise<number | null>((res, rej) => {
-    settle = res
-    fail = rej
-  })
-  return { probe: () => pending, resolve: (major) => settle(major), reject: (e) => fail(e) }
-}
-
 describe('opencode plugin install', () => {
-  it('writes the marker-bearing 1.x plugin once the probe decides 1.x (idempotent)', async () => {
-    await installOpencodeHooks(versionProbe(1))
-    await installOpencodeHooks(versionProbe(1))
+  it('writes the marker-bearing consolidated plugin (idempotent content)', () => {
+    installOpencodeHooks()
+    installOpencodeHooks()
     const body = fs.readFileSync(planted(), 'utf8')
     expect(body.startsWith(PLUGIN_MARKER)).toBe(true)
     expect(body).toContain('NODETERM_NODE_ID')
     expect(body).toContain('/hook/opencode')
   })
-  it('never overwrites a user 1.x file without the marker — on either side of the decision', async () => {
+  it('never overwrites a user file at the primary path', () => {
     fs.mkdirSync(path.dirname(planted()), { recursive: true })
     fs.writeFileSync(planted(), '// my own plugin\n')
-    await installOpencodeHooks(versionProbe(1)) // the plant branch must not touch it
-    await installOpencodeHooks(versionProbe(2)) // the remove branch must not touch it
+    installOpencodeHooks()
     expect(fs.readFileSync(planted(), 'utf8')).toBe('// my own plugin\n')
   })
-  it('remove deletes only a marker-bearing 1.x file', async () => {
-    await installOpencodeHooks(versionProbe(1))
+  it('remove deletes only a marker-bearing file at the primary path', () => {
+    installOpencodeHooks()
     removeOpencodeHooks()
     expect(fs.existsSync(planted())).toBe(false)
     fs.mkdirSync(path.dirname(planted()), { recursive: true })
@@ -124,7 +97,8 @@ describe('generated plugin behavior (executed)', () => {
     const file = path.join(tmp, `plugin-under-test-${Math.random().toString(36).slice(2)}.mjs`)
     fs.writeFileSync(file, buildOpencodePlugin())
     const mod = await import(/* @vite-ignore */ `file://${file}`)
-    return mod.NodetermStatus()
+    // The v1 dispatch the 1.18.29 loader performs: hooks.push(await plugin.server(input, …)).
+    return mod.default.server()
   }
 
   afterEach(() => {
@@ -235,7 +209,7 @@ describe('generated plugin unix-socket transport', () => {
     const file = path.join(tmp, `plugin-sock-${Math.random().toString(36).slice(2)}.mjs`)
     fs.writeFileSync(file, buildOpencodePlugin())
     const mod = await import(/* @vite-ignore */ `file://${file}`)
-    return mod.NodetermStatus()
+    return mod.default.server()
   }
 
   it('posts over the unix socket via node:http when NODETERM_HOOK_SOCK is set (no port)', async () => {
@@ -345,7 +319,7 @@ describe('generated plugin presents the per-node token', () => {
     const file = path.join(tmp, `plugin-token-${Math.random().toString(36).slice(2)}.mjs`)
     fs.writeFileSync(file, buildOpencodePlugin())
     const mod = await import(/* @vite-ignore */ `file://${file}`)
-    return mod.NodetermStatus()
+    return mod.default.server()
   }
 
   /** Fires one event over the plain TCP `fetch` path and returns the headers it sent. */
@@ -483,7 +457,7 @@ describe('opencodeConfigDir honors XDG_CONFIG_HOME', () => {
     try {
       expect(opencodeConfigDir()).toBe(path.join(xdg, 'opencode'))
       expect(pluginPath()).toBe(path.join(xdg, 'opencode', 'plugins', 'nodeterm-status.js'))
-      await installOpencodeHooks(versionProbe(1))
+      installOpencodeHooks()
       const body = fs.readFileSync(path.join(xdg, 'opencode', 'plugins', 'nodeterm-status.js'), 'utf8')
       expect(body.startsWith(PLUGIN_MARKER)).toBe(true)
       // and NOT under ~/.config
@@ -504,182 +478,188 @@ describe('opencodeConfigDir honors XDG_CONFIG_HOME', () => {
   })
 })
 
-// Issue #1136. OpenCode 2.x needs a default export object `{ id, setup }`; OpenCode <= 1.2.10
-// calls every export as a function and dies on an object (bisected on real builds). So there are
-// TWO plugins: the 1.x file (named export only) and a 2.x DIRECTORY no 1.x glob matches.
-const planted2 = () => path.join(tmp, '.config', 'opencode', 'plugins', 'nodeterm-status-v2', 'index.js')
+// The consolidation migration (floor v1 >= 1.18.29). An older nodeterm planted TWO artifacts: the
+// 1.x named-export FILE at plugins/nodeterm-status.js and a 2.x DIRECTORY at
+// plugins/nodeterm-status-v2/. The consolidated build plants ONE file at the primary path and
+// retires the legacy pair marker-safely. Collision policy (source-verified in research): when the
+// primary is the user's OWN file (no marker), consolidated cannot be installed there — a
+// marker-managed legacy v2 index is RETAINED, not removed: removing it would strand the badge on
+// a 2.x machine nodeterm previously served, while on 1.x the legacy directory costs nothing (the
+// v1.18.29 glob loads files only, so a directory is invisible to every 1.x). When the user ever
+// removes their own file, the next install completes the migration lazily.
+describe('opencode plugin install — consolidated file + legacy two-artifact migration', () => {
+  const legacyDir = () => path.join(tmp, '.config', 'opencode', 'plugins', 'nodeterm-status-v2')
+  const legacyIndex = () => path.join(legacyDir(), 'index.js')
 
-describe('opencode plugin install — the 2.x directory plugin', () => {
-  it('plants both plugins, each marker-bearing, at the paths each opencode generation loads', async () => {
-    await installOpencodeHooks(versionProbe(1))
-    expect(v2PluginPath()).toBe(planted2())
-    expect(fs.readFileSync(planted(), 'utf8')).toBe(buildOpencodePlugin())
-    expect(fs.readFileSync(planted2(), 'utf8')).toBe(buildOpencodeV2Plugin())
-    expect(fs.readFileSync(planted2(), 'utf8').startsWith(PLUGIN_MARKER)).toBe(true)
-  })
-  it('refreshes a stale managed copy (an older build\'s body) but never a user file', async () => {
+  /** The two-artifact layout an older nodeterm leaves behind. */
+  const plantLegacyLayout = (primaryBody: string, v2Body: string) => {
     fs.mkdirSync(path.dirname(planted()), { recursive: true })
-    fs.mkdirSync(path.dirname(planted2()), { recursive: true })
-    fs.writeFileSync(planted(), PLUGIN_MARKER + '\n// old v1 body\n')
-    fs.writeFileSync(planted2(), PLUGIN_MARKER + '\n// old v2 body\n')
-    await installOpencodeHooks(versionProbe(1))
+    fs.mkdirSync(legacyDir(), { recursive: true })
+    fs.writeFileSync(planted(), primaryBody)
+    fs.writeFileSync(legacyIndex(), v2Body)
+  }
+
+  it('targets the legacy layout at the exact paths an older nodeterm planted', () => {
+    expect(legacyV2PluginDir()).toBe(legacyDir())
+    expect(legacyV2PluginPath()).toBe(legacyIndex())
+  })
+
+  it('installs the consolidated plugin synchronously — no probe, no await', () => {
+    installOpencodeHooks()
+    expect(fs.existsSync(planted())).toBe(true)
     expect(fs.readFileSync(planted(), 'utf8')).toBe(buildOpencodePlugin())
-    expect(fs.readFileSync(planted2(), 'utf8')).toBe(buildOpencodeV2Plugin())
-    fs.writeFileSync(planted2(), '// my own v2 plugin\n')
-    await installOpencodeHooks(versionProbe(1))
-    expect(fs.readFileSync(planted2(), 'utf8')).toBe('// my own v2 plugin\n')
   })
-  it('does not rewrite an up-to-date file (opencode 2.x watches plugin files and reloads on change)', async () => {
-    const d = deferredProbe()
-    const pending = installOpencodeHooks(d.probe)
+
+  it('migrates a managed old-layout pair: primary becomes consolidated, legacy v2 index and directory are removed', () => {
+    plantLegacyLayout(PLUGIN_MARKER + '\n// old 1.x body\n', PLUGIN_MARKER + '\n// old 2.x body\n')
+    installOpencodeHooks()
+    expect(fs.readFileSync(planted(), 'utf8')).toBe(buildOpencodePlugin())
+    expect(fs.existsSync(legacyIndex())).toBe(false)
+    expect(fs.existsSync(legacyDir())).toBe(false) // removed only when empty
+  })
+
+  it('migrates the legacy-only layout a version-gated build left on a known-2.x machine (no primary at all)', () => {
+    fs.mkdirSync(legacyDir(), { recursive: true })
+    fs.writeFileSync(legacyIndex(), PLUGIN_MARKER + '\n// old 2.x body\n')
+    installOpencodeHooks()
+    expect(fs.existsSync(planted())).toBe(true)
+    expect(fs.readFileSync(planted(), 'utf8')).toBe(buildOpencodePlugin())
+    expect(fs.existsSync(legacyDir())).toBe(false)
+  })
+
+  it('keeps unrelated contents when retiring the legacy directory (rmdir-if-empty only)', () => {
+    plantLegacyLayout(PLUGIN_MARKER + '\n// old 1.x body\n', PLUGIN_MARKER + '\n// old 2.x body\n')
+    fs.writeFileSync(path.join(legacyDir(), 'notes.txt'), 'mine')
+    installOpencodeHooks()
+    expect(fs.existsSync(legacyIndex())).toBe(false)
+    expect(fs.readFileSync(path.join(legacyDir(), 'notes.txt'), 'utf8')).toBe('mine')
+  })
+
+  it('keeps a user-customized legacy v2 index verbatim (no marker → not ours to remove)', () => {
+    plantLegacyLayout(PLUGIN_MARKER + '\n// old 1.x body\n', '// my own v2 plugin\n')
+    installOpencodeHooks()
+    expect(fs.readFileSync(planted(), 'utf8')).toBe(buildOpencodePlugin())
+    expect(fs.readFileSync(legacyIndex(), 'utf8')).toBe('// my own v2 plugin\n')
+    expect(fs.existsSync(legacyDir())).toBe(true)
+  })
+
+  it("RETAINS a managed legacy v2 plugin when the primary is the user's own file — no stranded badge, nothing of theirs touched", () => {
+    // The collision: consolidated cannot be installed at the primary, so removing the legacy v2
+    // would strand every 2.x machine nodeterm previously served. Retain it VERBATIM (not even
+    // refreshed — one builder only, and a stale body still speaks the current wire contract).
+    plantLegacyLayout('// my own plugin\n', PLUGIN_MARKER + '\n// old 2.x body\n')
+    installOpencodeHooks()
+    expect(fs.readFileSync(planted(), 'utf8')).toBe('// my own plugin\n')
+    expect(fs.readFileSync(legacyIndex(), 'utf8')).toBe(PLUGIN_MARKER + '\n// old 2.x body\n')
+    expect(fs.existsSync(legacyDir())).toBe(true)
+  })
+
+  it("plants nothing at all when the primary is the user's and no legacy v2 exists", () => {
+    fs.mkdirSync(path.dirname(planted()), { recursive: true })
+    fs.writeFileSync(planted(), '// my own plugin\n')
+    installOpencodeHooks()
+    expect(fs.readFileSync(planted(), 'utf8')).toBe('// my own plugin\n')
+    expect(fs.existsSync(legacyDir())).toBe(false)
+  })
+
+  it('completes the migration lazily once the user removes their own file', () => {
+    plantLegacyLayout('// my own plugin\n', PLUGIN_MARKER + '\n// old 2.x body\n')
+    installOpencodeHooks() // retained — the previous test's policy
+    fs.rmSync(planted()) // the user deletes their own file
+    installOpencodeHooks()
+    expect(fs.existsSync(planted())).toBe(true)
+    expect(fs.readFileSync(planted(), 'utf8')).toBe(buildOpencodePlugin())
+    expect(fs.existsSync(legacyDir())).toBe(false)
+  })
+
+  it('does not rewrite an up-to-date consolidated file: a second install preserves its mtime', () => {
+    installOpencodeHooks()
+    expect(fs.existsSync(planted())).toBe(true)
     const past = Math.floor(Date.now() / 1000) - 60 // whole seconds: mtimeMs is a float
-    fs.utimesSync(planted2(), past, past)
-    d.resolve(1)
-    await pending
-    expect(Math.round(fs.statSync(planted2()).mtimeMs / 1000)).toBe(past)
-    // A second install must preserve both files: rewriting either triggers plugin watchers.
     fs.utimesSync(planted(), past, past)
-    await installOpencodeHooks(versionProbe(1))
+    installOpencodeHooks()
     expect(Math.round(fs.statSync(planted()).mtimeMs / 1000)).toBe(past)
-    expect(Math.round(fs.statSync(planted2()).mtimeMs / 1000)).toBe(past)
   })
-  it('remove deletes both managed plugins and the now-empty directory, but keeps anything else', async () => {
-    await installOpencodeHooks(versionProbe(1))
+
+  it('does not rewrite the migrated consolidated file either (migration, then a second install)', () => {
+    plantLegacyLayout(PLUGIN_MARKER + '\n// old 1.x body\n', PLUGIN_MARKER + '\n// old 2.x body\n')
+    installOpencodeHooks()
+    const past = Math.floor(Date.now() / 1000) - 60
+    fs.utimesSync(planted(), past, past)
+    installOpencodeHooks()
+    expect(Math.round(fs.statSync(planted()).mtimeMs / 1000)).toBe(past)
+  })
+
+  it('remove deletes the consolidated file, the legacy v2 index and the empty directory — but never a user file', () => {
+    plantLegacyLayout(PLUGIN_MARKER + '\n// old 1.x body\n', PLUGIN_MARKER + '\n// old 2.x body\n')
     removeOpencodeHooks()
     expect(fs.existsSync(planted())).toBe(false)
-    expect(fs.existsSync(path.dirname(planted2()))).toBe(false)
-    await installOpencodeHooks(versionProbe(1))
-    fs.writeFileSync(path.join(path.dirname(planted2()), 'notes.txt'), 'mine')
+    expect(fs.existsSync(legacyDir())).toBe(false)
+    // A user's own primary survives; the managed legacy index beside it still goes.
+    plantLegacyLayout('// my own plugin\n', PLUGIN_MARKER + '\n// old 2.x body\n')
     removeOpencodeHooks()
-    expect(fs.existsSync(planted2())).toBe(false)
-    expect(fs.readFileSync(path.join(path.dirname(planted2()), 'notes.txt'), 'utf8')).toBe('mine')
+    expect(fs.readFileSync(planted(), 'utf8')).toBe('// my own plugin\n')
+    expect(fs.existsSync(legacyIndex())).toBe(false)
+    expect(fs.existsSync(legacyDir())).toBe(false)
+    // A user's own legacy index survives, and so does the directory holding it.
+    plantLegacyLayout(PLUGIN_MARKER + '\n// old 1.x body\n', '// my own v2 plugin\n')
+    removeOpencodeHooks()
+    expect(fs.existsSync(planted())).toBe(false)
+    expect(fs.readFileSync(legacyIndex(), 'utf8')).toBe('// my own v2 plugin\n')
+    expect(fs.existsSync(legacyDir())).toBe(true)
+    // Unrelated contents in the directory survive the index's removal (rmdir-if-empty only).
+    plantLegacyLayout(PLUGIN_MARKER + '\n// old 1.x body\n', PLUGIN_MARKER + '\n// old 2.x body\n')
+    fs.writeFileSync(path.join(legacyDir(), 'notes.txt'), 'mine')
+    removeOpencodeHooks()
+    expect(fs.existsSync(legacyIndex())).toBe(false)
+    expect(fs.readFileSync(path.join(legacyDir(), 'notes.txt'), 'utf8')).toBe('mine')
   })
-})
 
-// The version gate (the second half of the 2.x fix). The pair is planted by GENERATION of the
-// installed CLI: the 2.x directory always (it is invisible to every 1.x glob), the 1.x FILE
-// only where the installed CLI is 1.x or its version is unknown — never planted "for a moment"
-// on a known 2.x, which WARNs on the file at every load and reloads on every change.
-describe('opencode install — the version-gated 1.x file', () => {
-  it('plants the 2.x directory synchronously and holds the 1.x file until the version is known', async () => {
-    const d = deferredProbe()
-    const pending = installOpencodeHooks(d.probe)
-    expect(fs.readFileSync(planted2(), 'utf8').startsWith(PLUGIN_MARKER)).toBe(true) // armed at once
-    expect(fs.existsSync(planted())).toBe(false) // NOT even temporarily planted on an unknown box
-    d.resolve(1)
-    await pending
+  it('remove handles the consolidated-only layout (no legacy directory ever planted)', () => {
+    installOpencodeHooks()
+    expect(fs.existsSync(planted())).toBe(true)
+    removeOpencodeHooks()
+    expect(fs.existsSync(planted())).toBe(false)
+    installOpencodeHooks() // re-enabled after an opt-out: a fresh install plants again
     expect(fs.existsSync(planted())).toBe(true)
   })
 
-  it('known 2.x never plants the 1.x file, and migrates away the managed copy an older nodeterm left', async () => {
-    // The upgrade path: every nodeterm before this gate planted the 1.x file unconditionally.
-    fs.mkdirSync(path.dirname(planted()), { recursive: true })
-    fs.writeFileSync(planted(), PLUGIN_MARKER + '\n// the old unconditional 1.x body\n')
-    await installOpencodeHooks(versionProbe(2))
-    expect(fs.existsSync(planted())).toBe(false) // marker-managed legacy copy removed
-    expect(fs.readFileSync(planted2(), 'utf8').startsWith(PLUGIN_MARKER)).toBe(true) // 2.x armed
-  })
-
-  it('known 2.x leaves a user\'s own 1.x file exactly as it was (no marker → not ours to remove)', async () => {
-    fs.mkdirSync(path.dirname(planted()), { recursive: true })
-    fs.writeFileSync(planted(), '// my own plugin\n')
-    await installOpencodeHooks(versionProbe(2))
-    expect(fs.readFileSync(planted(), 'utf8')).toBe('// my own plugin\n')
-  })
-
-  it('known 1.x plants the 1.x file — a 2.x→1.x downgrade is not stranded badge-less', async () => {
-    await installOpencodeHooks(versionProbe(2)) // a previous launch decided 2.x: the file is gone
-    expect(fs.existsSync(planted())).toBe(false)
-    await installOpencodeHooks(versionProbe(1)) // the user downgraded opencode
-    expect(fs.readFileSync(planted(), 'utf8')).toBe(buildOpencodePlugin())
-  })
-
-  it('unknown version (no CLI found, timeout, unreadable output) plants the 1.x file conservatively', async () => {
-    // Conservative = today's behavior: every <=1.x machine keeps its badge even when the probe
-    // cannot answer, at the cost of the harmless load WARN on a 2.x machine.
-    await installOpencodeHooks(versionProbe(null))
-    expect(fs.readFileSync(planted(), 'utf8')).toBe(buildOpencodePlugin())
-  })
-
-  it('a probe that rejects is contained and treated as unknown: v1 planted, install never rejects', async () => {
-    await installOpencodeHooks(() => Promise.reject(new Error('probe boom')))
-    expect(fs.readFileSync(planted(), 'utf8')).toBe(buildOpencodePlugin())
-  })
-
-  it('a decision still pending behind a remove/opt-out writes nothing afterwards', async () => {
-    const d = deferredProbe()
-    const pending = installOpencodeHooks(d.probe) // launch-time install, probe still in flight
-    removeOpencodeHooks() // the user declines opencode in Settings (or uninstalls)
-    d.resolve(1) // a late "1.x" answer must NOT re-plant what the opt-out deleted
-    await pending
-    expect(fs.existsSync(planted())).toBe(false)
-    expect(fs.existsSync(planted2())).toBe(false)
-    expect(fs.existsSync(path.dirname(planted2()))).toBe(false)
-  })
-
-  it('a NEW install after the opt-out still plants (the gate cancels only superseded decisions)', async () => {
-    const d = deferredProbe()
-    const stale = installOpencodeHooks(d.probe)
+  it('remove handles the legacy-only layout (no primary ever planted)', () => {
+    fs.mkdirSync(legacyDir(), { recursive: true })
+    fs.writeFileSync(legacyIndex(), PLUGIN_MARKER + '\n// old 2.x body\n')
     removeOpencodeHooks()
-    d.resolve(1)
-    await stale
-    await installOpencodeHooks(versionProbe(1)) // re-enabled: a fresh generation may plant again
-    expect(fs.readFileSync(planted(), 'utf8')).toBe(buildOpencodePlugin())
-    expect(fs.readFileSync(planted2(), 'utf8')).toBe(buildOpencodeV2Plugin())
+    expect(fs.existsSync(planted())).toBe(false)
+    expect(fs.existsSync(legacyDir())).toBe(false)
+  })
+
+  // Symlink safety (investigated, expectations kept): reads FOLLOW a user's link — a non-marker
+  // target reads as "not ours", so a symlinked user file is never overwritten — while deletions
+  // act on the LINK itself (fs.rmSync/fs.rmdirSync never follow into the target), so neither
+  // install nor remove can destroy what a link points at.
+  describe.skipIf(process.platform === 'win32')('symlinks', () => {
+    it('treats a user symlink at the primary path as their own file — link and target untouched', () => {
+      const real = path.join(tmp, 'my-real-status.js')
+      fs.writeFileSync(real, '// my own plugin\n')
+      fs.mkdirSync(path.dirname(planted()), { recursive: true })
+      fs.symlinkSync(real, planted())
+      installOpencodeHooks()
+      expect(fs.lstatSync(planted()).isSymbolicLink()).toBe(true)
+      expect(fs.readFileSync(real, 'utf8')).toBe('// my own plugin\n')
+    })
+
+    it('remove deletes a marker-managed symlink itself, never the file it points at', () => {
+      const real = path.join(tmp, 'managed-real-status.js')
+      fs.writeFileSync(real, PLUGIN_MARKER + '\n// old 1.x body\n')
+      fs.mkdirSync(path.dirname(planted()), { recursive: true })
+      fs.symlinkSync(real, planted())
+      removeOpencodeHooks()
+      expect(fs.existsSync(planted())).toBe(false) // the LINK is gone
+      expect(fs.readFileSync(real, 'utf8')).toBe(PLUGIN_MARKER + '\n// old 1.x body\n') // the file is not
+    })
   })
 })
 
-// The probe that feeds the gate. `opencodeMajorFrom` is the pure decision input;
-// `probeOpencodeMajorAt` runs a FAKE CLI from a temp dir (never the machine's real opencode —
-// a sh script printing the measured `--version` line), so the spawn/exit-code plumbing is
-// exercised without touching any real installation.
-describe('opencodeMajorFrom — the version parser', () => {
-  it('reads the measured `--version` shapes', () => {
-    expect(opencodeMajorFrom('opencode v2.2.5\n')).toBe(2) // MEASURED, 2026-11-05, exit 0
-    expect(opencodeMajorFrom('2.0.30')).toBe(2)
-    expect(opencodeMajorFrom('1.18.3')).toBe(1)
-    expect(opencodeMajorFrom('1.2.10')).toBe(1) // the last call-every-export-as-a-function build
-  })
-  it('answers null — "unknown", the conservative branch — for anything it cannot read a version out of', () => {
-    expect(opencodeMajorFrom('opencode: command not found')).toBeNull()
-    expect(opencodeMajorFrom('')).toBeNull()
-    expect(opencodeMajorFrom('   ')).toBeNull()
-    expect(opencodeMajorFrom(null)).toBeNull()
-    expect(opencodeMajorFrom(undefined)).toBeNull()
-  })
-})
-
-describe.skipIf(process.platform === 'win32')('probeOpencodeMajorAt — the bounded CLI probe', () => {
-  let dir: string
-  beforeEach(() => {
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nt-oc-probe-'))
-  })
-  afterEach(() => {
-    fs.rmSync(dir, { recursive: true, force: true })
-  })
-
-  /** A fake `opencode` binary: prints the given `--version` line (the real CLI's measured shape). */
-  const fakeBin = (line: string, exit = 0): string => {
-    const bin = path.join(dir, 'opencode')
-    fs.writeFileSync(bin, `#!/bin/sh\necho '${line}'\nexit ${exit}\n`)
-    fs.chmodSync(bin, 0o755)
-    return bin
-  }
-
-  it('answers the major the CLI printed on stdout', async () => {
-    expect(await probeOpencodeMajorAt(fakeBin('opencode v2.2.5'))).toBe(2)
-    expect(await probeOpencodeMajorAt(fakeBin('opencode 1.18.3'))).toBe(1)
-  })
-  it('answers null when there is no version to read, or the CLI exits non-zero', async () => {
-    expect(await probeOpencodeMajorAt(fakeBin('command not found'))).toBeNull()
-    expect(await probeOpencodeMajorAt(fakeBin('opencode v2.2.5', 1))).toBeNull()
-  })
-  it('answers null when no binary exists at the path', async () => {
-    expect(await probeOpencodeMajorAt(path.join(dir, 'missing'))).toBeNull()
-  })
-})
-
-describe('generated plugins, module shapes (executed)', () => {
+describe('the consolidated plugin — module shape and adapters (executed)', () => {
   let posts: Array<Record<string, unknown>>
 
   beforeEach(() => {
@@ -707,16 +687,25 @@ describe('generated plugins, module shapes (executed)', () => {
   })
 
   type V1Hooks = Record<string, (input: unknown) => Promise<void>>
-  type V2Def = { id: string; setup: (ctx: unknown) => Promise<(() => void) | void> }
+  type PluginDef = {
+    id: string
+    server: () => Promise<V1Hooks>
+    setup: (ctx: unknown) => Promise<(() => void) | void>
+  }
 
   async function load(body: string): Promise<Record<string, unknown>> {
     const file = path.join(tmp, `plugin-${Math.random().toString(36).slice(2)}.mjs`)
     fs.writeFileSync(file, body)
     return import(/* @vite-ignore */ `file://${file}`)
   }
-  const loadV1 = async (): Promise<{ NodetermStatus: () => Promise<V1Hooks> }> =>
-    (await load(buildOpencodePlugin())) as unknown as { NodetermStatus: () => Promise<V1Hooks> }
-  const loadV2 = async (): Promise<V2Def> => (await load(buildOpencodeV2Plugin())).default as V2Def
+
+  /** Loads the consolidated module and returns its default — asserting the export shape on the
+   *  way, so a regression against the hybrid shape fails as a readable diff, not a TypeError. */
+  const loadPlugin = async (): Promise<PluginDef> => {
+    const mod = await load(buildOpencodePlugin())
+    expect(Object.keys(mod)).toEqual(['default'])
+    return mod.default as PluginDef
+  }
 
   /** A 2.x context: an event stream we push into, and a tool-hook registry. */
   function v2Context(): {
@@ -776,24 +765,39 @@ describe('generated plugins, module shapes (executed)', () => {
   }
   const flush = (): Promise<void> => new Promise((r) => setTimeout(r, 0))
 
-  it('1.x file: ONLY the named function export — a default would crash opencode <= 1.2.10', async () => {
-    const mod = await load(buildOpencodePlugin())
-    // opencode <= 1.2.10 does `for (const [, fn] of Object.entries(mod)) await fn(input)`.
-    expect(Object.keys(mod)).toEqual(['NodetermStatus'])
-    for (const v of Object.values(mod)) expect(typeof v).toBe('function')
-  })
-
-  it('2.x directory plugin: a default OBJECT with an id and a setup function, nothing else exported', async () => {
-    const mod = await load(buildOpencodeV2Plugin())
-    expect(Object.keys(mod)).toEqual(['default'])
-    const def = mod.default as V2Def
+  it('exports exactly a default object — id, server, setup, nothing else', async () => {
+    // The documented hybrid (opencode.ai/v2/docs/build/plugins/migrate-v1, "Support V1 and V2
+    // from one package"), verified against the v1.18.29 loader: a default OBJECT engages when
+    // it carries id+server, and a file-source plugin MUST export a string id. No named exports
+    // exist any more — the v1 support floor is 1.18.29, where object entrypoints landed.
+    const def = await loadPlugin()
     expect(typeof def).toBe('object')
+    expect(typeof def.id).toBe('string')
     expect(def.id).toBe('nodeterm-status')
+    expect(typeof def.server).toBe('function')
     expect(typeof def.setup).toBe('function')
   })
 
+  it('v1 dispatch — server() returns the hooks bag the 1.18.29 loader pushes', async () => {
+    // The loader does `hooks.push(await plugin.server(input, load.options))`; the bag's members
+    // are the hooks, and bus events arrive ONLY through the `event` catch-all.
+    const def = await loadPlugin()
+    const hooks = await def.server()
+    expect(typeof hooks.event).toBe('function')
+    expect(typeof hooks['tool.execute.before']).toBe('function')
+    await hooks.event({ event: { type: 'session.idle', properties: { sessionID: 'ses_1' } } })
+    expect(posts).toEqual([{ event: 'session.idle', sessionID: 'ses_1' }])
+  })
+
+  it('v1 with no NODETERM_NODE_ID (outside nodeterm) arms nothing', async () => {
+    vi.stubEnv('NODETERM_NODE_ID', '')
+    const def = await loadPlugin()
+    expect(await def.server()).toEqual({})
+    expect(g[LATCH]).toBeUndefined()
+  })
+
   it('2.x: translates the event stream to the 1.x wire names normalizeOpencode reads', async () => {
-    const def = await loadV2()
+    const def = await loadPlugin()
     const v2 = v2Context()
     await def.setup(v2.ctx)
     expect(v2.subscribed()).toBe(1)
@@ -834,7 +838,7 @@ describe('generated plugins, module shapes (executed)', () => {
   it('2.x: a real 2.0.30 TUI turn (as captured) normalizes to the same states as a 1.x turn', async () => {
     // The order a measured `opencode --standalone` turn produced: a shell call behind a
     // permission prompt, then a question form, then the end of the turn.
-    const def = await loadV2()
+    const def = await loadPlugin()
     const v2 = v2Context()
     await def.setup(v2.ctx)
     const hook = v2.toolHooks[0].cb
@@ -869,7 +873,7 @@ describe('generated plugins, module shapes (executed)', () => {
   })
 
   it('2.x: the tool hook posts tool.execute.before and never throws into the tool call', async () => {
-    const def = await loadV2()
+    const def = await loadPlugin()
     const v2 = v2Context()
     await def.setup(v2.ctx)
     expect(v2.toolHooks.map((h) => h.name)).toEqual(['execute.before'])
@@ -880,7 +884,7 @@ describe('generated plugins, module shapes (executed)', () => {
   })
 
   it('2.x: a subagent child session does not move the node, but its blocking prompts do (under the root id)', async () => {
-    const def = await loadV2()
+    const def = await loadPlugin()
     const v2 = v2Context()
     await def.setup(v2.ctx)
     v2.push('session.created', { sessionID: 'ses_c', parentID: 'ses_1' })
@@ -907,7 +911,7 @@ describe('generated plugins, module shapes (executed)', () => {
     // rejects it at load — no default export), so a v2 that steps aside in `--service` processes
     // leaves no subscriber anywhere and the badge froze. Yielding was a 1.x-era rule (there the
     // v1 file COULD load in the same process); on 2.x setup() must arm and stay armed.
-    const def = await loadV2()
+    const def = await loadPlugin()
     const v2 = v2Context()
     const argv = process.argv
     process.argv = ['bun', '/$bunfs/root/opencode', 'serve', '--service']
@@ -930,7 +934,7 @@ describe('generated plugins, module shapes (executed)', () => {
     // Removing the --service yield must not overcorrect: the node-id gate (makePoster() → null)
     // keeps the plugin inert outside nodeterm-spawned envs, whatever the process shape is.
     vi.stubEnv('NODETERM_NODE_ID', '')
-    const def = await loadV2()
+    const def = await loadPlugin()
     const v2 = v2Context()
     const argv = process.argv
     process.argv = ['bun', '/$bunfs/root/opencode', 'serve', '--service']
@@ -942,14 +946,6 @@ describe('generated plugins, module shapes (executed)', () => {
     expect(v2.subscribed()).toBe(0)
     expect(v2.toolHooks).toEqual([])
     expect(g[LATCH]).toBeUndefined()
-  })
-
-  it('2.x: the generated template carries no `--service` early return', () => {
-    // Durable source guard, ported from the local regression suite's `service_early_return_absent`:
-    // if the early return ever comes back, every 2.x machine's badge dies silently again (see the
-    // service-server test above for why). Asserted on the exact expression so that comments ABOUT
-    // `serve --service` may still live in the template.
-    expect(buildOpencodeV2Plugin()).not.toContain("argv.includes('--service')")
   })
 
   it('2.x: posts the full wire format from a `--service` server to a local unix-socket collector', async () => {
@@ -994,7 +990,7 @@ describe('generated plugins, module shapes (executed)', () => {
       vi.stubEnv('NODETERM_HOOK_TOKEN', 'hook-token')
       vi.stubEnv('NODETERM_HOOK_VERSION', '2')
       vi.stubEnv('NODETERM_NODE_TOKEN_DIR', tokenDir)
-      const def = await loadV2()
+      const def = await loadPlugin()
       const v2 = v2Context()
       const argv = process.argv
       process.argv = ['bun', '/$bunfs/root/opencode', 'serve', '--service']
@@ -1030,16 +1026,31 @@ describe('generated plugins, module shapes (executed)', () => {
   })
 
   it('2.x: a context without an event stream (a 1.x compatibility pass) is a no-op', async () => {
-    const def = await loadV2()
+    const def = await loadPlugin()
     await def.setup({ options: {}, agent: {}, catalog: {} })
     await def.setup(undefined)
     expect(g[LATCH]).toBeUndefined()
   })
 
-  it('both plugins in ONE process: 1.x armed first keeps 2.x inert (no double posts)', async () => {
-    const v1 = await loadV1()
-    const hooks = await v1.NodetermStatus()
-    const def = await loadV2()
+  it('2.x: the cleanup setup returns aborts the subscription', async () => {
+    const def = await loadPlugin()
+    const v2 = v2Context()
+    const cleanup = await def.setup(v2.ctx)
+    expect(typeof cleanup).toBe('function')
+    expect(v2.signal()?.aborted).toBe(false)
+    ;(cleanup as () => void)()
+    expect(v2.signal()?.aborted).toBe(true)
+    v2.end()
+  })
+
+  // ── Latch arbitration (one process, both adapters) ────────────────────────────────────────
+  // A process normally runs only ONE generation's loader, but both adapters live in one module
+  // now: a 2.x that ever grows a v1 compatibility layer, or repeated arming in one process (one
+  // plugin instance per project directory), must not double-post. The first API to arm owns the
+  // process — keyed by API, not by call.
+  it('server() armed first keeps setup() inert (one process, both adapters)', async () => {
+    const def = await loadPlugin()
+    const hooks = await def.server()
     const v2 = v2Context()
     await def.setup(v2.ctx)
     expect(v2.subscribed()).toBe(0)
@@ -1047,20 +1058,18 @@ describe('generated plugins, module shapes (executed)', () => {
     expect(posts).toEqual([{ event: 'session.idle', sessionID: 'ses_1' }])
   })
 
-  it('both plugins in ONE process: 2.x armed first keeps the 1.x hooks empty', async () => {
-    const def = await loadV2()
+  it('setup() armed first keeps server() empty', async () => {
+    const def = await loadPlugin()
     const v2 = v2Context()
     await def.setup(v2.ctx)
-    const v1 = await loadV1()
-    expect(await v1.NodetermStatus()).toEqual({})
+    expect(await def.server()).toEqual({})
     v2.end()
   })
 
-  it('the latch is per API, not per call: a second plugin instance of the SAME API still arms', async () => {
-    const v1 = await loadV1()
-    expect(typeof (await v1.NodetermStatus()).event).toBe('function')
-    expect(typeof (await v1.NodetermStatus()).event).toBe('function')
-    const def = await loadV2()
+  it('the latch is per API, not per call: second instances of the SAME API still arm', async () => {
+    const def = await loadPlugin()
+    expect(typeof (await def.server()).event).toBe('function')
+    expect(typeof (await def.server()).event).toBe('function') // one process, two project dirs
     delete g[LATCH]
     const a = v2Context()
     const b = v2Context()
@@ -1072,14 +1081,11 @@ describe('generated plugins, module shapes (executed)', () => {
     b.end()
   })
 
-  it('2.x: the cleanup setup returns aborts the subscription', async () => {
-    const def = await loadV2()
-    const v2 = v2Context()
-    const cleanup = await def.setup(v2.ctx)
-    expect(typeof cleanup).toBe('function')
-    expect(v2.signal()?.aborted).toBe(false)
-    ;(cleanup as () => void)()
-    expect(v2.signal()?.aborted).toBe(true)
-    v2.end()
+  it('the generated template carries no `--service` early return', () => {
+    // Durable source guard, ported from the local regression suite's `service_early_return_absent`
+    // and now pointed at the SINGLE builder: if the early return ever comes back, every 2.x
+    // machine's badge dies silently again (see the service-server test above for why). Asserted
+    // on the exact expression so that comments ABOUT `serve --service` may still live there.
+    expect(buildOpencodePlugin()).not.toContain("argv.includes('--service')")
   })
 })

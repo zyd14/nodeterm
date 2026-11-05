@@ -1,32 +1,30 @@
 // opencode hook service. Unlike claude/gemini (JSON settings merge) and codex (hooks.json +
 // trust hash), opencode's hook seam is its PLUGIN system: JS modules in
 // ~/.config/opencode/plugins/ whose hooks fire on session/tool/permission events.
-// nodeterm owns its plugin files outright (marker-gated — a user's own file is never touched).
-// opencode loads plugins on EVERY CLI command, so the plugins are env-gated: without the
-// NODETERM_* env of a nodeterm-spawned session they do nothing.
+// nodeterm owns its plugin file outright (marker-gated — a user's own file is never touched).
+// opencode loads plugins on EVERY CLI command, so the plugin is env-gated: without the
+// NODETERM_* env of a nodeterm-spawned session it does nothing.
 //
-// TWO plugin APIs exist, and one file cannot serve both (issue #1136). MEASURED, 2026-10-16:
-//  - OpenCode 2.x (@opencode/cli 2.0.30) loads `plugins/*.js` AND plugin directories
-//    (`plugins/<name>/index.js`) and requires a DEFAULT export object `{ id, setup }`; a module
-//    without one is skipped with a WARN ("Plugin must export a default definition…"). A function
-//    default is refused too ("Expected object at [\"default\"]").
-//  - OpenCode 1.x loads only `{plugin,plugins}/*.{ts,js}` FILES, and up to 1.2.10 it calls EVERY
-//    export as a function: an object default throws `fn is not a function` and kills every opencode
-//    command on the machine, inside nodeterm or not (bisected: 1.2.10 crashes, 1.2.11 does not).
-// So the V1 plugin stays a file with only the named export (V2 merely WARNs about it), and the V2
-// plugin is a DIRECTORY, which no 1.x glob matches. Which of them is PLANTED is gated on the
-// installed CLI's major version — see the version probe above installOpencodeHooks(): on a
-// known 2.x the 1.x file is not planted at all (and a managed copy from an older nodeterm is
-// removed), because 2.x WARNs on it at every load and reloads plugin files on change.
+// ONE consolidated plugin serves BOTH generations (issue #1136, consolidated 2026-11-05):
+// plugins/nodeterm-status.js with a default export { id, server, setup } — v1 calls server()
+// and pushes the returned hooks bag (object entrypoints are documented from v1 1.18.29 and
+// verified in the 1.18.29 loader source: auto-discovery loads {plugin,plugins}/*.{ts,js}
+// FILES only, a default OBJECT engages when it carries id+server, and a file-source plugin
+// MUST export a string id), v2 calls setup(ctx) (the documented hybrid, "Support V1 and V2
+// from one package" — the extra server key rides along). v1 < 1.18.29 — including the
+// <= 1.2.10 build that called every export as a function and crashed on an object default —
+// is out of nodeterm's support window by decision: the floor was raised rather than keep two
+// artifacts per machine. Which loader generation runs the file decides ITSELF at load time,
+// so installation is a plain synchronous plant (installOpencodeHooks below).
+//
+// LEGACY LAYOUT: pre-consolidation nodeterm planted TWO artifacts — the 1.x named-export file
+// (this same primary path) plus a nodeterm-status-v2/ DIRECTORY for 2.x, gated on a version
+// probe of the installed CLI. installOpencodeHooks migrates that layout away marker-safely;
+// removeOpencodeHooks still cleans both. See their docstrings for the exact policy.
 import fs from 'fs'
 import os from 'os'
 import path from 'path'
-import { execFile } from 'child_process'
-import { promisify } from 'util'
 import { parseEndpointEnv } from '../hook-endpoint-parse'
-import { directExecutableInvocation, findInLoginPath } from '../../exec-path'
-
-const execFileP = promisify(execFile)
 
 export const PLUGIN_MARKER = '// nodeterm managed plugin — do not edit (reinstalled at app launch)'
 
@@ -39,29 +37,33 @@ export function opencodeConfigDir(): string {
     : path.join(os.homedir(), '.config', 'opencode')
 }
 
-/** The OpenCode 1.x plugin file. */
+/** The managed plugin file — auto-discovered by both generations (v1's glob loads
+ *  `{plugin,plugins}/*.{ts,js}` FILES; v2 loads `plugins/*.js` files and directories). */
 export function pluginPath(): string {
   return path.join(opencodeConfigDir(), 'plugins', 'nodeterm-status.js')
 }
 
-/** The OpenCode 2.x plugin DIRECTORY (see the header: a directory is invisible to every 1.x). */
-export function v2PluginDir(): string {
+/** The LEGACY OpenCode 2.x plugin DIRECTORY planted by pre-consolidation nodeterm builds.
+ *  Kept only as a migration/removal target — the consolidated plugin never plants it again. */
+export function legacyV2PluginDir(): string {
   return path.join(opencodeConfigDir(), 'plugins', 'nodeterm-status-v2')
 }
 
-export function v2PluginPath(): string {
-  return path.join(v2PluginDir(), 'index.js')
+/** The legacy directory's index — the file the old 2.x builder wrote. */
+export function legacyV2PluginPath(): string {
+  return path.join(legacyV2PluginDir(), 'index.js')
 }
 
-/** Which API armed in this process. Both plugins can end up loaded by one process (V2 loads the
- *  V1 file too and only skips it because it has no default export; a future build with a V1
- *  compatibility layer might run it). The first API to arm owns the process and the other stays
- *  inert, so no build posts every event twice. Keyed by API, not by call: one process may arm the
- *  same API more than once (one plugin instance per project directory). */
+/** Which API armed in this process. Both adapters live in ONE module now, and a process
+ *  normally runs only one generation's loader — but the latch still guards the edges: a 2.x
+ *  that ever grows a v1 compatibility layer, or one process loading the module more than once
+ *  (one plugin instance per project directory). The first API to arm owns the process and the
+ *  other stays inert, so no build posts every event twice. Keyed by API, not by call: one
+ *  process may arm the same API more than once. */
 const LATCH = "Symbol.for('nodeterm.opencode.status.api')"
 
-/** The shared poster, embedded verbatim in both plugins. Mirrors the managed POSIX script's wire
- *  contract exactly (see managed-script.ts + hook-server.ts):
+/** The shared poster, embedded verbatim in the plugin (BOTH adapters use it). Mirrors the
+ *  managed POSIX script's wire contract exactly (see managed-script.ts + hook-server.ts):
  *  - gate on NODETERM_NODE_ID (absent outside nodeterm-spawned sessions → no poster);
  *  - per POST, re-read the NODETERM_HOOK_ENDPOINT FILE (KEY=VALUE lines) for the LIVE
  *    port/token — tmux sessions outlive the app, so env-baked coords go stale after a
@@ -160,28 +162,65 @@ const makePoster = () => {
 `
 }
 
-/** The OpenCode 1.x plugin: ONLY the named export — never a default (see the header).
- *  Bus events (session.created/idle/error, message.updated, permission.updated/replied)
- *  reach a plugin ONLY through the `event` catch-all hook as { event: { type, properties } }
- *  — opencode never calls a hook keyed by the event name itself, so per-event-name exports
- *  are dead code (the bug that made every status silently missing). `tool.execute.before`
- *  is the exception: it IS a real named plugin hook. The event NAME posted is the contract
- *  with normalizeOpencode (permission.updated is posted as `permission.asked`);
- *  sessionID/role are extracted defensively per the SDK payload shapes. message.updated
- *  forwards ONLY user messages (turn start) so assistant token streaming never floods the
- *  hook server — and only ONCE per messageID: measured on 1.18.3 (TUI), the user message
- *  record is updated again after session.idle (title/bookkeeping), and re-forwarding that
- *  as a turn start resurrected `working` right after `done` (newTurn bypasses the
- *  done-holdoff by design), pinning the node on RUNNING forever. */
+/** The managed OpenCode status plugin — ONE consolidated file serving BOTH plugin generations
+ *  (the documented hybrid, opencode.ai/v2/docs/build/plugins/migrate-v1, "Support V1 and V2
+ *  from one package"):
+ *  - v1 >= 1.18.29 calls `default.server()` and pushes the returned hooks bag. Verified in the
+ *    1.18.29 loader source: a default OBJECT engages when it carries `id` + `server`, and a
+ *    file-source plugin MUST export a string `id` — hence `id: 'nodeterm-status'`.
+ *  - v2 calls `default.setup(ctx)` (the v2.2.5 Module schema is the `{ id, setup }` struct;
+ *    the extra `server` key is exactly the documented hybrid shape).
+ *  Both adapters embed the poster/prelude ONCE (sharedPrelude above) and arbitrate through
+ *  the per-API LATCH if both ever arm in one process.
+ *
+ *  V1 adapter (the hooks bag `server()` returns): bus events (session.created/idle/error,
+ *  message.updated, permission.updated/replied) reach a plugin ONLY through the `event`
+ *  catch-all hook as { event: { type, properties } } — opencode never calls a hook keyed by
+ *  the event name itself, so per-event-name exports are dead code (the bug that made every
+ *  status silently missing). `tool.execute.before` is the exception: it IS a real named
+ *  plugin hook. The event NAME posted is the contract with normalizeOpencode
+ *  (permission.updated is posted as `permission.asked`); sessionID/role are extracted
+ *  defensively per the SDK payload shapes. message.updated forwards ONLY user messages (turn
+ *  start) and only ONCE per messageID: measured on 1.18.3 (TUI), the user message record is
+ *  updated again after session.idle (title/bookkeeping), and re-forwarding that as a turn
+ *  start resurrected `working` right after `done` (newTurn bypasses the done-holdoff by
+ *  design), pinning the node on RUNNING forever.
+ *
+ *  V2 adapter (`setup(ctx)`, MEASURED on @opencode/cli 2.0.30, TUI and `run`, both
+ *  `--standalone`): setup runs in the SERVER process; `ctx.event.subscribe()` is an async
+ *  iterable of `{ id, created, type, location, data }`; `ctx.tool.hook('execute.before', cb)`
+ *  hands cb `{ tool, sessionID, … }` and fires BEFORE that call's permission.asked. A turn is
+ *  `session.execution.started` … `session.execution.succeeded | failed | interrupted` (Esc) —
+ *  there is no `session.idle` any more; questions are forms (`form.created` carries the
+ *  session under `data.form`, `form.replied|cancelled` under `data`); `session.created`
+ *  carries `parentID` for a subagent's child session. Every event is translated to the 1.x
+ *  wire names above, so normalizeOpencode has one dialect: execution.started →
+ *  message.updated (user), succeeded|interrupted → session.idle, failed → session.error,
+ *  form.* → question.*.
+ *
+ *  THE SHARED SERVER: by default every 2.x CLI talks to ONE background server (`serve
+ *  --service`) that keeps the environment of whichever pane started it and outlives it
+ *  (MEASURED: a second pane's events ran under the first pane's NODETERM_NODE_ID). setup()
+ *  arms wherever it is loaded — 2.x loads plugins ONLY in serve processes (measured in the
+ *  field across 2.1.3–2.2.5, Nov 2026), so every long-lived server on a nodeterm machine is
+ *  the managed `serve --service`, and stepping aside there would leave no subscriber anywhere
+ *  — the badge froze (the regression this arming rule fixed). Posts carry the server's own
+ *  NODETERM_NODE_ID (the pane that started it), so multi-pane attribution is imprecise while
+ *  a single active pane is exact — the trade the 1.x plugin made before 2.x, accepted over a
+ *  dead badge. setup() returns a cleanup that aborts the subscription (the v1 `dispose`
+ *  analogue). */
 export function buildOpencodePlugin(): string {
   return `${PLUGIN_MARKER}
-// OpenCode 1.x plugin. OpenCode 2.x logs "failed to load plugin … must export a default
-// definition" for this file at every start — harmless, and on a KNOWN 2.x nodeterm does not
-// plant it at all (installOpencodeHooks removes a managed copy there); this file exists only
-// where the installed opencode is 1.x or its version could not be determined. A default
-// export here would crash opencode <= 1.2.10.
+// OpenCode status plugin for BOTH generations — the documented hybrid ("Support V1 and V2
+// from one package"): v1 (>= 1.18.29, where object entrypoints landed) calls default.server()
+// and pushes the returned hooks bag; v2 calls default.setup(ctx). A process runs only ONE of
+// them; the latch below keeps one poster per process even if both ever arm.
 ${sharedPrelude()}
-export const NodetermStatus = async () => {
+// The v1 hooks bag. Bus events reach a plugin ONLY through the \`event\` catch-all as
+// { event: { type, properties } } — never through a hook named after the event. message.updated
+// forwards only user messages, once per messageID (see the builder's docstring: a post-idle
+// bookkeeping touch must not resurrect a finished turn).
+const v1Hooks = async () => {
   const post = makePoster()
   if (!post) return {}
   if (!claim('v1')) return {}
@@ -225,36 +264,8 @@ export const NodetermStatus = async () => {
       post('tool.execute.before', { sessionID: input && input.sessionID })
   }
 }
-`
-}
 
-/** The OpenCode 2.x plugin: a default `{ id, setup }` (the only shape 2.x accepts). MEASURED on
- *  @opencode/cli 2.0.30 (TUI and `run`, both `--standalone`):
- *  - `setup(ctx)` runs in the SERVER process; `ctx.event.subscribe()` is an async iterable of
- *    `{ id, created, type, location, data }`; `ctx.tool.hook('execute.before', cb)` hands cb
- *    `{ tool, sessionID, … }` and fires BEFORE that call's permission.asked;
- *  - a turn is `session.execution.started` … `session.execution.succeeded | failed | interrupted`
- *    (Esc) — there is no `session.idle` any more; questions are forms (`form.created` carries the
- *    session under `data.form`, `form.replied|cancelled` under `data`);
- *  - `session.created` carries `parentID` for a subagent's child session.
- *  Every event is translated to the 1.x wire names above, so normalizeOpencode has one dialect:
- *  execution.started → message.updated (user), succeeded|interrupted → session.idle, failed →
- *  session.error, form.* → question.*.
- *  THE SHARED SERVER: by default every 2.x CLI talks to ONE background server (`serve --service`)
- *  that keeps the environment of whichever pane started it and outlives it (MEASURED: a second
- *  pane's events ran under the first pane's NODETERM_NODE_ID). This template once refused to arm
- *  there so the 1.x file beside it could report instead — sound only while both generations could
- *  load: 2.x rejects that file at load (no default export) and loads plugins ONLY in serve
- *  processes (measured in the field across 2.1.3–2.2.5, Nov 2026), so every long-lived server on
- *  a nodeterm machine is the managed `serve --service` and the yield left no subscriber anywhere
- *  — the badge froze. setup() now arms wherever it is loaded; posts carry the server's own
- *  NODETERM_NODE_ID (the pane that started it), so multi-pane attribution is imprecise while a
- *  single active pane is exact — the trade the 1.x plugin made before 2.x, accepted here over a
- *  dead badge. */
-export function buildOpencodeV2Plugin(): string {
-  return `${PLUGIN_MARKER}
-// OpenCode 2.x plugin (a directory, so that no OpenCode 1.x ever loads it).
-${sharedPrelude()}
+// The v2 event stream, translated to the v1 wire names (normalizeOpencode has one dialect).
 // A subagent runs in a CHILD session (session.created carries parentID). Its turn boundaries are
 // not the node's — a child's execution.started would re-key the node to the child's session and
 // its succeeded would read as the node going idle mid-turn — but a child's permission or form
@@ -306,6 +317,9 @@ const translate = (post, children) => {
 
 export default {
   id: 'nodeterm-status',
+  async server() {
+    return v1Hooks()
+  },
   async setup(ctx) {
     if (!ctx || !ctx.event || typeof ctx.event.subscribe !== 'function') return
     const post = makePoster()
@@ -337,7 +351,10 @@ export default {
 `
 }
 
-/** Write `body` to `file` unless a file WITHOUT our marker is there (a user's own — never touched). */
+/** Write `body` to `file` unless a file WITHOUT our marker is there (a user's own — never
+ *  touched; the read follows symlinks, so a user's link to their own file is equally safe).
+ *  A byte-identical body is not rewritten: opencode 2.x watches plugin files and reloads on
+ *  change, so an unchanged second install must not touch mtime. */
 function plantManaged(file: string, body: string): void {
   try {
     const existing = fs.readFileSync(file, 'utf8')
@@ -350,132 +367,8 @@ function plantManaged(file: string, body: string): void {
   fs.writeFileSync(file, body, 'utf8')
 }
 
-// ── The version probe ─────────────────────────────────────────────────────────────────────
-// WHICH of the two plugins gets planted is decided by the installed CLI's major version: the
-// 1.x file is the only thing 1.x can load, but 2.x rejects it at every load (the WARN in the
-// header) AND watches plugin files for reloads — so a 2.x machine must not carry it at all,
-// not even between an install and a removal one launch later. The probe is modeled on
-// claude-cli.ts (memoized for the process, bounded, never rejects, UNKNOWN on any failure) so
-// the same conventions hold across CLIs.
-
-const OPENCODE_PROBE_TIMEOUT_MS = 5000
-
-/**
- * Pure: an `opencode --version` output line → its MAJOR version, or null when no
- * `major.minor.patch` is readable. Null must be read as "unknown", never as 2 — the caller's
- * unknown branch is the conservative one that keeps planting the 1.x file.
- *
- * Mirrors the repo's version-floor convention (`versionAtLeast`, shared/agents/config.ts): the
- * FIRST `major.minor.patch` on the line is the answer. MEASURED, 2026-11-05: the 2.x CLI
- * prints `opencode v2.2.5` (exit 0).
- *
- * @param versionOutput stdout of `opencode --version` (null/undefined when there was none)
- * @returns the major version (e.g. 2), or null when the line carries no readable version
- */
-export function opencodeMajorFrom(versionOutput: string | null | undefined): number | null {
-  const m = (versionOutput ?? '').match(/(\d+)\.(\d+)\.(\d+)/)
-  return m ? Number(m[1]) : null
-}
-
-/**
- * Probe the binary at `bin` for its major version: run `<bin> --version` bounded by a 5s
- * timeout and parse the output. Missing binary, timeout and non-zero exit all resolve to null
- * (unknown) — this never rejects, exactly like the claude probe it is modeled on.
- *
- * @param bin an already-resolved executable path (the login-shell PATH walk happens in
- *   `opencodeMajor` below — a GUI app does not inherit the user's shell PATH)
- * @returns the CLI's major version, or null when unknown
- */
-export async function probeOpencodeMajorAt(bin: string): Promise<number | null> {
-  try {
-    const invocation = directExecutableInvocation(bin, ['--version'])
-    if (!invocation) return null
-    const { stdout } = await execFileP(invocation.executable, invocation.args, {
-      ...invocation.options,
-      timeout: OPENCODE_PROBE_TIMEOUT_MS
-    })
-    return opencodeMajorFrom(stdout)
-  } catch {
-    // Missing CLI, timeout, non-zero exit — all mean "unknown", which means "plant the 1.x
-    // file conservatively", never "guess 2.x and delete it".
-    return null
-  }
-}
-
-let cachedMajor: Promise<number | null> | null = null
-
-/**
- * The installed OpenCode's major version, or null when unknown (no CLI found, timeout,
- * unreadable output). Memoized for the process lifetime — the answer resolves the login shell
- * and spawns the CLI, and it only changes when the user upgrades (which a relaunch picks up).
- * Never rejects.
- */
-export function opencodeMajor(): Promise<number | null> {
-  if (!cachedMajor) {
-    cachedMajor = findInLoginPath('opencode')
-      .then((bin) => (bin ? probeOpencodeMajorAt(bin) : null))
-      .catch(() => null)
-  }
-  return cachedMajor
-}
-
-/** The version probe as an injectable seam (the default is the memoized real probe above).
- *  Resolves the installed CLI's major version, or null when unknown; never rejects. */
-export type OpencodeVersionProbe = () => Promise<number | null>
-
-// Installations are generational: removeOpencodeHooks() (the opt-out/uninstall path) bumps the
-// generation, so a decision that was still waiting on the version probe when the user declined
-// opencode — or uninstalled the app — can no longer write anything. Without this, a late
-// "1.x" answer would re-plant exactly the files the opt-out deleted, minutes after the user
-// asked for them gone.
-let installGeneration = 0
-
-/**
- * Plant the managed plugins for the OpenCode generation(s) the machine can run.
- *
- * The 2.x DIRECTORY plants synchronously — it is invisible to every 1.x glob (see the header)
- * and it is the only plugin a 2.x machine can load. The 1.x FILE is decided by `probe` once it
- * answers:
- *  - major >= 2: never planted, and a marker-managed copy an older nodeterm planted is REMOVED
- *    (the upgrade migration; a user's own file without the marker is never touched either way);
- *  - major <= 1, or UNKNOWN (no CLI found, probe failed, unreadable output): planted
- *    conservatively — a <=1.x machine's badge must not depend on the probe succeeding, at the
- *    cost of the harmless load WARN on a 2.x machine, which is the status quo this replaces.
- * The 1.x file is NOT planted before the probe answers: 2.x watches plugin files and reloads on
- * change, so planting it "for a moment" would WARN on every launch of a 2.x machine — the very
- * noise this gate exists to stop.
- *
- * Returns a promise that settles once the version decision has been applied. It never
- * rejects: a failed decision is contained with a console.warn, so the fire-and-forget registry
- * entry (`hooks/index.ts`) stays quiet. The synchronous part may still throw on a filesystem
- * error, exactly as before this became async — the registry's per-agent catch handles that.
- *
- * @param probe the version probe to consult (tests inject a controlled answer; production
- *   uses the default memoized `opencodeMajor`)
- */
-export function installOpencodeHooks(probe: OpencodeVersionProbe = opencodeMajor): Promise<void> {
-  const generation = installGeneration
-  // Resolved once, NOW: the decision runs after the probe, possibly after a spied/moved home —
-  // re-resolving there would send the late decision into the wrong home (antigravity's lesson,
-  // hooks/antigravity.ts installAntigravityHooksWithProbe).
-  const v1Path = pluginPath()
-  plantManaged(v2PluginPath(), buildOpencodeV2Plugin())
-  return (
-    Promise.resolve()
-      .then(probe)
-      // A probe that fails is an unknown version — the conservative branch plants.
-      .catch(() => null)
-      .then((major) => {
-        if (generation !== installGeneration) return // a remove/opt-out superseded this pass
-        if (major !== null && major >= 2) removeManaged(v1Path)
-        else plantManaged(v1Path, buildOpencodePlugin())
-      })
-      .catch((e) => {
-        console.warn('[agent-hooks] opencode install failed', e)
-      })
-  )
-}
-
+/** Remove `file` only when it is marker-managed. Deletions act on the path itself: a symlink
+ *  goes, the file it points at never does (fs.rmSync does not follow links). */
 function removeManaged(file: string): void {
   try {
     if (fs.readFileSync(file, 'utf8').startsWith(PLUGIN_MARKER)) fs.rmSync(file, { force: true })
@@ -484,15 +377,51 @@ function removeManaged(file: string): void {
   }
 }
 
-export function removeOpencodeHooks(): void {
-  // Cancel any version decision still waiting on the probe: the user opted out (or
-  // uninstalled), and a late "1.x" answer must not re-plant what this removal deleted.
-  installGeneration++
-  removeManaged(pluginPath())
-  removeManaged(v2PluginPath())
-  // The directory is ours by name; drop it only when nothing of anyone else's is left in it.
+/**
+ * Install (or refresh) the consolidated managed plugin, and complete the migration off the
+ * legacy two-artifact layout an older nodeterm planted (the 1.x named-export file + the
+ * nodeterm-status-v2/ directory). Synchronous: WHICH loader generation runs the file decides
+ * itself at load time (v1 calls server(), v2 calls setup), so there is nothing to probe for
+ * and nothing to await.
+ *
+ * Order and policy (each branch tested):
+ *  1. If the primary path holds a file WITHOUT our marker (the user's own), touch NOTHING and
+ *     return — not their file, and not a marker-managed legacy v2 index either: consolidated
+ *     cannot be installed there, and removing the legacy plugin would strand the badge on a
+ *     2.x machine nodeterm previously served (on 1.x the legacy directory costs nothing —
+ *     the v1.18.29 glob loads files only). The next install after the user removes their own
+ *     file completes the migration lazily.
+ *  2. Otherwise retire the legacy v2 artifacts FIRST — marker-gated index removal, then
+ *     rmdir of the directory only when empty — BEFORE planting, so no 2.x process ever runs
+ *     two same-id plugins at once.
+ *  3. Plant/refresh the consolidated file at the primary path (marker-gated; byte-identical
+ *     writes are skipped, so a second install never touches mtime — 2.x reloads on change).
+ */
+export function installOpencodeHooks(): void {
   try {
-    fs.rmdirSync(v2PluginDir())
+    const primary = fs.readFileSync(pluginPath(), 'utf8')
+    if (!primary.startsWith(PLUGIN_MARKER)) return
+  } catch {
+    /* absent — the path is free; plant below */
+  }
+  removeManaged(legacyV2PluginPath())
+  try {
+    // The directory is ours by name; drop it only when nothing of anyone else's is left in it.
+    fs.rmdirSync(legacyV2PluginDir())
+  } catch {
+    /* absent, or not empty (a user's file survives) — leave it */
+  }
+  plantManaged(pluginPath(), buildOpencodePlugin())
+}
+
+/** Remove everything nodeterm manages at BOTH the consolidated path and the legacy ones —
+ *  marker-gated everywhere, so a user's own file at either location survives, and deletions
+ *  act on a symlink itself, never the file it points at. */
+export function removeOpencodeHooks(): void {
+  removeManaged(pluginPath())
+  removeManaged(legacyV2PluginPath())
+  try {
+    fs.rmdirSync(legacyV2PluginDir())
   } catch {
     /* absent, or not empty — leave it */
   }
